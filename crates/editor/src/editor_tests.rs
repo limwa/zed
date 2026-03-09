@@ -428,6 +428,47 @@ fn test_ime_composition(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_deleting_marked_text_removes_dead_key_character(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.update(|cx| MultiBuffer::build_simple("", cx));
+    cx.add_window(|window, cx| {
+        let mut editor = build_editor(buffer, window, cx);
+
+        editor.replace_and_mark_text_in_range(None, "~", None, window, cx);
+        assert_eq!(editor.text(cx), "~");
+        assert_eq!(editor.marked_text_ranges(cx).is_some(), true);
+
+        editor.replace_text_in_range(None, "", window, cx);
+
+        assert_eq!(editor.text(cx), "");
+        assert_eq!(editor.marked_text_ranges(cx), None);
+
+        editor
+    });
+}
+
+#[gpui::test]
+fn test_unmarking_marked_text_keeps_dead_key_character(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.update(|cx| MultiBuffer::build_simple("", cx));
+    cx.add_window(|window, cx| {
+        let mut editor = build_editor(buffer, window, cx);
+
+        editor.replace_and_mark_text_in_range(None, "~", None, window, cx);
+        assert_eq!(editor.text(cx), "~");
+
+        editor.unmark_text(window, cx);
+
+        assert_eq!(editor.text(cx), "~");
+        assert_eq!(editor.marked_text_ranges(cx), None);
+
+        editor
+    });
+}
+
+#[gpui::test]
 fn test_selection_with_mouse(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
