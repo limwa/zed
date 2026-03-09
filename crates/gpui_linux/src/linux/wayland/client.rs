@@ -344,13 +344,13 @@ impl WaylandClientStatePtr {
 
         let had_preedit =
             state.pre_edit_text.take().is_some() || state.ime_pre_edit.take().is_some();
-        state.suppress_ime_events = had_preedit || state.composing;
+        state.suppress_ime_events = true;
         state.composing = false;
         if let Some(compose_state) = state.compose_state.as_mut() {
             compose_state.reset();
         }
 
-        let should_reset_text_input = had_preedit && state.text_input.is_some();
+        let should_reset_text_input = state.text_input.is_some();
         let window = state.keyboard_focused_window.clone();
         drop(state);
 
