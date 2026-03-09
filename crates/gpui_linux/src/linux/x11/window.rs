@@ -1,7 +1,7 @@
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
-use crate::linux::X11ClientStatePtr;
+use crate::linux::{X11ClientStatePtr, delete_marked_text, should_cancel_preedit};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
@@ -1087,13 +1087,12 @@ impl X11WindowStatePtr {
         if let Some(mut fun) = callback {
             let result = fun(input.clone());
             self.callbacks.borrow_mut().input = Some(fun);
+            if should_cancel_preedit(&input, &result) {
+                let client = self.state.borrow().client.clone();
+                client.cancel_preedit();
+                return;
+            }
             if !result.propagate {
-                if let PlatformInput::KeyDown(event) = &input
-                    && event.keystroke.key_char.is_none()
-                {
-                    let client = self.state.borrow().client.clone();
-                    client.cancel_preedit();
-                }
                 return;
             }
         }
@@ -1159,9 +1158,7 @@ impl X11WindowStatePtr {
         let mut state = self.state.borrow_mut();
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            if let Some(marked) = input_handler.marked_text_range() {
-                input_handler.replace_text_in_range(Some(marked), "");
-            }
+            delete_marked_text(&mut input_handler);
             let mut state = self.state.borrow_mut();
             state.input_handler = Some(input_handler);
         }

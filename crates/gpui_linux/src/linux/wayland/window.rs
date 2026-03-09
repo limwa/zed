@@ -28,7 +28,9 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
-use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
+use crate::linux::{
+    Globals, Output, WaylandClientStatePtr, delete_marked_text, get_window, should_cancel_preedit,
+};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
@@ -898,9 +900,7 @@ impl WaylandWindowStatePtr {
                     input_handler.unmark_text();
                 }
                 ImeInput::DeleteText => {
-                    if let Some(marked) = input_handler.marked_text_range() {
-                        input_handler.replace_text_in_range(Some(marked), "");
-                    }
+                    delete_marked_text(&mut input_handler);
                 }
             }
             self.state.borrow_mut().input_handler = Some(input_handler);
@@ -992,13 +992,12 @@ impl WaylandWindowStatePtr {
         if let Some(mut fun) = callback {
             let result = fun(input.clone());
             self.callbacks.borrow_mut().input = Some(fun);
+            if should_cancel_preedit(&input, &result) {
+                let client = self.state.borrow().client.clone();
+                client.cancel_preedit();
+                return;
+            }
             if !result.propagate {
-                if let PlatformInput::KeyDown(event) = &input
-                    && event.keystroke.key_char.is_none()
-                {
-                    let client = self.state.borrow().client.clone();
-                    client.cancel_preedit();
-                }
                 return;
             }
         }
