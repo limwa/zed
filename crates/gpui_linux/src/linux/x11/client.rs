@@ -261,7 +261,7 @@ impl X11ClientStatePtr {
         drop(state);
 
         if had_preedit && let Some(window) = window {
-            window.handle_ime_unmark();
+            window.handle_ime_delete();
         }
     }
 

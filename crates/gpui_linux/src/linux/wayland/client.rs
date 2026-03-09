@@ -344,6 +344,15 @@ impl WaylandClientStatePtr {
 
         let had_preedit =
             state.pre_edit_text.take().is_some() || state.ime_pre_edit.take().is_some();
+        println!(
+            "WAYLAND cancel_preedit had_preedit={} composing={} suppress_before={} text_input={} ime_pre_edit={:?} pre_edit_text={:?}",
+            had_preedit,
+            state.composing,
+            state.suppress_ime_events,
+            state.text_input.is_some(),
+            state.ime_pre_edit,
+            state.pre_edit_text
+        );
         state.suppress_ime_events = true;
         state.composing = false;
         if let Some(compose_state) = state.compose_state.as_mut() {
@@ -1486,10 +1495,22 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
                         let mut keystroke =
                             keystroke_from_xkb(keymap_state, state.modifiers, keycode);
+                        println!(
+                            "WAYLAND wl_keyboard pressed raw keycode={:?} keysym={} modifiers={:?} keystroke_before_compose={:?}",
+                            keycode,
+                            xkb::keysym_get_name(keysym),
+                            state.modifiers,
+                            keystroke
+                        );
                         if let Some(mut compose) = state.compose_state.take() {
                             compose.feed(keysym);
                             match compose.status() {
                                 xkb::Status::Composing => {
+                                    println!(
+                                        "WAYLAND wl_keyboard compose status=Composing utf8={:?} underlying_dead_key={:?}",
+                                        compose.utf8(),
+                                        keystroke_underlying_dead_key(keysym)
+                                    );
                                     keystroke.key_char = None;
                                     state.pre_edit_text =
                                         compose.utf8().or(keystroke_underlying_dead_key(keysym));
@@ -1501,6 +1522,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                 }
 
                                 xkb::Status::Composed => {
+                                    println!(
+                                        "WAYLAND wl_keyboard compose status=Composed utf8={:?} keysym={:?}",
+                                        compose.utf8(),
+                                        compose.keysym().map(xkb::keysym_get_name)
+                                    );
                                     state.pre_edit_text.take();
                                     keystroke.key_char = compose.utf8();
                                     if let Some(keysym) = compose.keysym() {
@@ -1508,6 +1534,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                     }
                                 }
                                 xkb::Status::Cancelled => {
+                                    println!(
+                                        "WAYLAND wl_keyboard compose status=Cancelled prev_preedit={:?} new_preedit={:?}",
+                                        state.pre_edit_text,
+                                        keystroke_underlying_dead_key(keysym)
+                                    );
                                     let pre_edit = state.pre_edit_text.take();
                                     let new_pre_edit = keystroke_underlying_dead_key(keysym);
                                     state.pre_edit_text = new_pre_edit.clone();
@@ -1526,6 +1557,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             }
                             state.compose_state = Some(compose);
                         }
+                        println!(
+                            "WAYLAND wl_keyboard dispatching keydown keystroke_after_compose={:?}",
+                            keystroke
+                        );
                         let input = PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: keystroke.clone(),
                             is_held: false,
@@ -1613,6 +1648,10 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 this.disable_ime();
             }
             zwp_text_input_v3::Event::CommitString { text } => {
+                println!(
+                    "WAYLAND text_input CommitString text={:?} suppress={} composing={} ime_pre_edit={:?}",
+                    text, state.suppress_ime_events, state.composing, state.ime_pre_edit
+                );
                 if state.suppress_ime_events {
                     state.composing = false;
                     return;
@@ -1643,6 +1682,10 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 }
             }
             zwp_text_input_v3::Event::PreeditString { text, .. } => {
+                println!(
+                    "WAYLAND text_input PreeditString text={:?} suppress={} composing={}",
+                    text, state.suppress_ime_events, state.composing
+                );
                 if state.suppress_ime_events {
                     state.composing = false;
                     state.ime_pre_edit = None;
