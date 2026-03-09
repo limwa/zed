@@ -1006,10 +1006,6 @@ impl WaylandWindowStatePtr {
             && event.keystroke.modifiers.is_subset_of(&Modifiers::shift())
             && let Some(key_char) = &event.keystroke.key_char
         {
-            println!(
-                "WAYLAND handle_input inserting text key_char={:?} keystroke={:?}",
-                key_char, event.keystroke
-            );
             let mut state = self.state.borrow_mut();
             if let Some(mut input_handler) = state.input_handler.take() {
                 drop(state);
