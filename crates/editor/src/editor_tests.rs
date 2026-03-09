@@ -469,6 +469,30 @@ fn test_unmarking_marked_text_keeps_dead_key_character(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+async fn test_toggle_comments_with_marked_dead_key_text_at_line_start(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    let language = Arc::new(Language::new(
+        LanguageConfig {
+            line_comments: vec!["// ".into()],
+            ..Default::default()
+        },
+        Some(tree_sitter_rust::LANGUAGE.into()),
+    ));
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
+    cx.set_state("ˇfn hey() {\n    \n}\n");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.replace_and_mark_text_in_range(None, "~", None, window, cx);
+        editor.toggle_comments(&ToggleComments::default(), window, cx);
+        editor.replace_text_in_range(None, "", window, cx);
+    });
+
+    cx.assert_editor_state("// ˇfn hey() {\n    \n}\n");
+}
+
+#[gpui::test]
 fn test_selection_with_mouse(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

@@ -16248,6 +16248,11 @@ impl Editor {
         if self.read_only(cx) {
             return;
         }
+
+        if self.marked_text_ranges(cx).is_some() {
+            self.replace_text_in_range(None, "", window, cx);
+        }
+
         self.hide_mouse_cursor(HideMouseCursorOrigin::TypingAction, cx);
         let text_layout_details = &self.text_layout_details(window, cx);
         self.transact(window, cx, |this, window, cx| {
