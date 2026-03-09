@@ -1091,7 +1091,8 @@ impl X11WindowStatePtr {
                 if let PlatformInput::KeyDown(event) = &input
                     && event.keystroke.key_char.is_none()
                 {
-                    self.state.borrow().client.cancel_preedit();
+                    let client = self.state.borrow().client.clone();
+                    client.cancel_preedit();
                 }
                 return;
             }
