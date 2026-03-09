@@ -227,6 +227,44 @@ impl X11ClientStatePtr {
         self.0.upgrade().map(X11Client)
     }
 
+    pub fn cancel_preedit(&self) {
+        let Some(client) = self.get_client() else {
+            return;
+        };
+
+        let mut state = client.0.borrow_mut();
+        let had_preedit = state.pre_edit_text.take().is_some();
+        state.pre_key_char_down.take();
+        state.composing = false;
+        if let Some(compose_state) = state.compose_state.as_mut() {
+            compose_state.reset();
+        }
+
+        let should_reset_xim = state.ximc.is_some();
+        if should_reset_xim {
+            if let Some(mut ximc) = state.ximc.take() {
+                if let Some(xim_handler) = state.xim_handler.as_ref() {
+                    ximc.reset_ic(xim_handler.im_id, xim_handler.ic_id).ok();
+                } else {
+                    log::error!("bug: xim handler not set in cancel_preedit");
+                }
+                state.ximc = Some(ximc);
+            }
+        }
+
+        let window = state.keyboard_focused_window.and_then(|window| {
+            state
+                .windows
+                .get(&window)
+                .map(|window| window.window.clone())
+        });
+        drop(state);
+
+        if had_preedit && let Some(window) = window {
+            window.handle_ime_unmark();
+        }
+    }
+
     pub fn drop_window(&self, x_window: u32) {
         let Some(client) = self.get_client() else {
             return;

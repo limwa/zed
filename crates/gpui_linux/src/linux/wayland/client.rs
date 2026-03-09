@@ -337,6 +337,31 @@ impl WaylandClientStatePtr {
         }
     }
 
+    pub fn cancel_preedit(&self) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+
+        let had_preedit =
+            state.pre_edit_text.take().is_some() || state.ime_pre_edit.take().is_some();
+        state.composing = false;
+        if let Some(compose_state) = state.compose_state.as_mut() {
+            compose_state.reset();
+        }
+
+        let should_reset_text_input = had_preedit && state.text_input.is_some();
+        let window = state.keyboard_focused_window.clone();
+        drop(state);
+
+        if should_reset_text_input {
+            self.disable_ime();
+            self.enable_ime();
+        }
+
+        if had_preedit && let Some(window) = window {
+            window.handle_ime(ImeInput::UnmarkText);
+        }
+    }
+
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let client = self.get_client();
         let state = client.borrow_mut();

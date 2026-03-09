@@ -254,6 +254,11 @@ let
 
       cargoVendorDir = craneLib.vendorCargoDeps {
         inherit src cargoLock;
+        
+        outputHashes = {
+          # Needed because repository uses Git LFS
+        };
+        
         overrideVendorGitCheckout =
           let
             hasWebRtcSys = builtins.any (crate: crate.name == "webrtc-sys");

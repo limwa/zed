@@ -993,6 +993,11 @@ impl WaylandWindowStatePtr {
             let result = fun(input.clone());
             self.callbacks.borrow_mut().input = Some(fun);
             if !result.propagate {
+                if let PlatformInput::KeyDown(event) = &input
+                    && event.keystroke.key_char.is_none()
+                {
+                    self.state.borrow().client.cancel_preedit();
+                }
                 return;
             }
         }
