@@ -215,6 +215,7 @@ pub(crate) struct WaylandClientState {
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pre_edit_text: Option<String>,
     ime_pre_edit: Option<String>,
+    suppress_ime_events: bool,
     composing: bool,
     // Surface to Window mapping
     windows: HashMap<ObjectId, WaylandWindowStatePtr>,
@@ -343,6 +344,7 @@ impl WaylandClientStatePtr {
 
         let had_preedit =
             state.pre_edit_text.take().is_some() || state.ime_pre_edit.take().is_some();
+        state.suppress_ime_events = had_preedit || state.composing;
         state.composing = false;
         if let Some(compose_state) = state.compose_state.as_mut() {
             compose_state.reset();
@@ -615,6 +617,7 @@ impl WaylandClient {
             text_input: None,
             pre_edit_text: None,
             ime_pre_edit: None,
+            suppress_ime_events: false,
             composing: false,
             outputs: HashMap::default(),
             in_progress_outputs,
@@ -1610,6 +1613,11 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 this.disable_ime();
             }
             zwp_text_input_v3::Event::CommitString { text } => {
+                if state.suppress_ime_events {
+                    state.composing = false;
+                    return;
+                }
+
                 state.composing = false;
                 let Some(window) = state.keyboard_focused_window.clone() else {
                     return;
@@ -1635,12 +1643,26 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 }
             }
             zwp_text_input_v3::Event::PreeditString { text, .. } => {
+                if state.suppress_ime_events {
+                    state.composing = false;
+                    state.ime_pre_edit = None;
+                    return;
+                }
+
                 state.composing = true;
                 state.ime_pre_edit = text;
             }
             zwp_text_input_v3::Event::Done { serial } => {
                 let last_serial = state.serial_tracker.get(SerialKind::InputMethod);
                 state.serial_tracker.update(SerialKind::InputMethod, serial);
+
+                if state.suppress_ime_events {
+                    state.suppress_ime_events = false;
+                    state.ime_pre_edit = None;
+                    state.composing = false;
+                    return;
+                }
+
                 let Some(window) = state.keyboard_focused_window.clone() else {
                     return;
                 };
