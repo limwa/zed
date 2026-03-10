@@ -984,18 +984,25 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    pub fn handle_input(&self, input: PlatformInput) {
+    pub fn handle_input(&self, input: PlatformInput) -> gpui::DispatchEventResult {
         if self.is_blocked() {
-            return;
+            return gpui::DispatchEventResult::default();
         }
         let callback = self.callbacks.borrow_mut().input.take();
         if let Some(mut fun) = callback {
             let result = fun(input.clone());
             self.callbacks.borrow_mut().input = Some(fun);
             if !result.propagate {
-                return;
+                return result;
             }
+            self.dispatch_platform_text_input(input);
+            return result;
         }
+        self.dispatch_platform_text_input(input);
+        gpui::DispatchEventResult::default()
+    }
+
+    fn dispatch_platform_text_input(&self, input: PlatformInput) {
         if let PlatformInput::KeyDown(event) = input
             && event.keystroke.modifiers.is_subset_of(&Modifiers::shift())
         {

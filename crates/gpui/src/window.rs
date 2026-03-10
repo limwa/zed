@@ -1457,6 +1457,15 @@ impl Window {
 pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
+    pub key_dispatch_outcome: Option<KeyDispatchOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(missing_docs)]
+pub enum KeyDispatchOutcome {
+    HandledBinding,
+    PendingBinding,
+    Unhandled,
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -4004,6 +4013,28 @@ impl Window {
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
+            key_dispatch_outcome: self.key_dispatch_outcome_for_event(&event),
+        }
+    }
+
+    fn key_dispatch_outcome_for_event(&self, event: &PlatformInput) -> Option<KeyDispatchOutcome> {
+        match event {
+            PlatformInput::KeyDown(key_down) => {
+                if self.pending_input.as_ref().is_some_and(|pending| {
+                    pending.focus == self.focus
+                        && pending
+                            .keystrokes
+                            .last()
+                            .is_some_and(|pending| pending.keystroke == key_down.keystroke)
+                }) {
+                    Some(KeyDispatchOutcome::PendingBinding)
+                } else if self.default_prevented {
+                    Some(KeyDispatchOutcome::HandledBinding)
+                } else {
+                    Some(KeyDispatchOutcome::Unhandled)
+                }
+            }
+            _ => None,
         }
     }
 
