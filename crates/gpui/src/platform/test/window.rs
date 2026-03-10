@@ -30,6 +30,7 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    restored_dead_keys: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -75,6 +76,7 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            restored_dead_keys: Vec::new(),
         })))
     }
 
@@ -109,6 +111,10 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    pub fn restored_dead_keys(&self) -> Vec<String> {
+        self.0.lock().restored_dead_keys.clone()
     }
 }
 
@@ -299,6 +305,10 @@ impl PlatformWindow for TestWindow {
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+
+    fn restore_dead_key_state(&self, text: &str) {
+        self.0.lock().restored_dead_keys.push(text.to_string());
+    }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None

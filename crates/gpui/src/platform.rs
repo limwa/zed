@@ -541,6 +541,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
+    /// Recreate platform dead-key state before replaying deferred marked text.
+    ///
+    /// Platforms that do not require explicit dead-key restoration can ignore this hook.
     fn restore_dead_key_state(&self, _text: &str) {}
 
     #[cfg(any(test, feature = "test-support"))]

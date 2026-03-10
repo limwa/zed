@@ -689,6 +689,18 @@ impl VisualTestContext {
         }
     }
 
+    pub(crate) fn window_handle(&self) -> AnyWindowHandle {
+        self.window
+    }
+
+    pub(crate) fn test_window(&self) -> TestWindow {
+        self.cx.test_window(self.window)
+    }
+
+    pub(crate) fn executor(&self) -> BackgroundExecutor {
+        self.cx.executor()
+    }
+
     /// Wait until there are no more pending tasks.
     pub fn run_until_parked(&self) {
         self.cx.background_executor.run_until_parked();
@@ -841,8 +853,7 @@ impl VisualTestContext {
     /// Simulate an event from the platform, e.g. a ScrollWheelEvent
     /// Make sure you've called [VisualTestContext::draw] first!
     pub fn simulate_event<E: InputEvent>(&mut self, event: E) {
-        self.test_window(self.window)
-            .simulate_input(event.to_platform_input());
+        self.test_window().simulate_input(event.to_platform_input());
         self.background_executor.run_until_parked();
     }
 
