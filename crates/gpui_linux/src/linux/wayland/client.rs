@@ -75,10 +75,9 @@ use super::{
 
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, SCROLL_LINES,
-    capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state,
-    get_xkb_compose_state_for_locale, is_within_click_distance, keystroke_from_xkb,
-    keystroke_underlying_dead_key, modifiers_from_xkb, open_uri_internal, read_fd,
-    reveal_path_internal,
+    capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
+    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, open_uri_internal,
+    read_fd, reveal_path_internal,
     wayland::{
         clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
@@ -226,7 +225,6 @@ pub(crate) struct WaylandClientState {
     keyboard_layout: LinuxKeyboardLayout,
     keymap_state: Option<xkb::State>,
     compose_state: Option<xkb::compose::State>,
-    suspended_dead_key: Option<SuspendedDeadKey>,
     drag: DragState,
     click: ClickState,
     repeat: KeyRepeat,
@@ -265,11 +263,6 @@ pub struct ClickState {
     last_click: Instant,
     last_location: Point<Pixels>,
     current_count: usize,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SuspendedDeadKey {
-    pre_edit_text: String,
 }
 
 pub(crate) struct KeyRepeat {
@@ -369,55 +362,33 @@ impl WaylandClientStatePtr {
             .as_ref()
             .is_some_and(|window| window.surface_id() == surface_id)
         {
-            state.suspended_dead_key = Some(SuspendedDeadKey {
-                pre_edit_text: text.to_string(),
-            });
-        }
-    }
-
-    fn resume_suspended_dead_key(state: &mut WaylandClientState) {
-        let Some(suspended_dead_key) = state.suspended_dead_key.take() else {
-            return;
-        };
-
-        if state.pre_edit_text.is_some() {
-            state.suspended_dead_key = Some(suspended_dead_key);
-            return;
-        }
-
-        let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let locale = std::env::var_os("LC_CTYPE").unwrap_or_else(|| "C".into());
-        let Some(mut compose_state) = get_xkb_compose_state_for_locale(&xkb_context, &locale)
-            .or_else(|| get_xkb_compose_state(&xkb_context))
-        else {
-            return;
-        };
-
-        for character in suspended_dead_key.pre_edit_text.chars() {
-            let keysym_name = match character {
-                '~' => "dead_tilde",
-                '`' => "dead_grave",
-                '^' => "dead_circumflex",
-                '´' => "dead_acute",
-                '¨' => "dead_diaeresis",
-                _ => {
-                    state.suspended_dead_key = Some(suspended_dead_key);
-                    return;
-                }
+            let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+            let Some(mut compose_state) = get_xkb_compose_state(&xkb_context) else {
+                return;
             };
 
-            let keysym = xkb::keysym_from_name(keysym_name, xkb::KEYSYM_NO_FLAGS);
-            if keysym == xkb::Keysym::NoSymbol {
-                state.suspended_dead_key = Some(suspended_dead_key);
-                return;
+            for character in text.chars() {
+                let keysym_name = match character {
+                    '~' => "dead_tilde",
+                    '`' => "dead_grave",
+                    '^' => "dead_circumflex",
+                    '´' => "dead_acute",
+                    '¨' => "dead_diaeresis",
+                    _ => return,
+                };
+
+                let keysym = xkb::keysym_from_name(keysym_name, xkb::KEYSYM_NO_FLAGS);
+                if keysym == xkb::Keysym::NoSymbol {
+                    return;
+                }
+
+                compose_state.feed(keysym);
             }
 
-            compose_state.feed(keysym);
-        }
-
-        if compose_state.status() == xkb::Status::Composing {
-            state.pre_edit_text = Some(suspended_dead_key.pre_edit_text);
-            state.compose_state = Some(compose_state);
+            if compose_state.status() == xkb::Status::Composing {
+                state.pre_edit_text = Some(text.to_string());
+                state.compose_state = Some(compose_state);
+            }
         }
     }
 
@@ -666,7 +637,6 @@ impl WaylandClient {
             keyboard_layout: LinuxKeyboardLayout::new(UNKNOWN_KEYBOARD_LAYOUT_NAME),
             keymap_state: None,
             compose_state: None,
-            suspended_dead_key: None,
             drag: DragState {
                 data_offer: None,
                 window: None,
@@ -1444,7 +1414,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 };
                 state.keymap_state = Some(xkb::State::new(&keymap));
                 state.compose_state = get_xkb_compose_state(&xkb_context);
-                state.suspended_dead_key = None;
                 drop(state);
 
                 this.handle_keyboard_layout_change();
@@ -1452,7 +1421,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             wl_keyboard::Event::Enter { surface, .. } => {
                 state.keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.enter_token = Some(());
-                state.suspended_dead_key = None;
 
                 if let Some(window) = state.keyboard_focused_window.clone() {
                     drop(state);
@@ -1463,7 +1431,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.keyboard_focused_window = None;
                 state.enter_token.take();
-                state.suspended_dead_key = None;
                 // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
                 state.repeat.current_id += 1;
 
@@ -1515,9 +1482,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 ..
             } => {
                 state.serial_tracker.update(SerialKind::KeyPress, serial);
-                if matches!(key_state, wl_keyboard::KeyState::Pressed) {
-                    Self::resume_suspended_dead_key(&mut state);
-                }
 
                 let focused_window = state.keyboard_focused_window.clone();
                 let Some(focused_window) = focused_window else {
@@ -1562,13 +1526,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             .pre_edit_text
                             .clone()
                             .map(TextInputAction::SetMarkedText);
-                        let suspended_dead_key =
-                            text_input_action.as_ref().and_then(|action| match action {
-                                TextInputAction::SetMarkedText(text) => Some(SuspendedDeadKey {
-                                    pre_edit_text: text.clone(),
-                                }),
-                                TextInputAction::InsertText(_) => None,
-                            });
                         let started_deferred_dead_key = text_input_action.is_some();
                         let input = PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: keystroke.clone(),
@@ -1630,16 +1587,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                 compose.reset();
                             }
                             state.pre_edit_text.take();
-                            if dispatch_result.key_dispatch_outcome
-                                == Some(gpui::KeyDispatchOutcome::PendingBinding)
-                            {
-                                state.suspended_dead_key = suspended_dead_key;
-                            }
-                            if dispatch_result.key_dispatch_outcome
-                                == Some(gpui::KeyDispatchOutcome::HandledBinding)
-                            {
-                                state.suspended_dead_key = None;
-                            }
                         }
                     }
                     wl_keyboard::KeyState::Released if !keysym.is_modifier_key() => {
