@@ -4385,6 +4385,9 @@ impl Window {
     }
 
     fn apply_text_input_action(&mut self, action: &TextInputAction, cx: &mut App) {
+        if let TextInputAction::SetMarkedText(text) = action {
+            self.platform_window.restore_dead_key_state(text);
+        }
         if let Some(mut input_handler) = self.platform_window.take_input_handler() {
             match action {
                 TextInputAction::InsertText(text) => input_handler.dispatch_input(text, self, cx),

@@ -542,6 +542,10 @@ impl WaylandWindowStatePtr {
         self.state.borrow().handle
     }
 
+    pub fn surface_id(&self) -> ObjectId {
+        self.state.borrow().surface.id()
+    }
+
     pub fn surface(&self) -> wl_surface::WlSurface {
         self.state.borrow().surface.clone()
     }
@@ -1477,6 +1481,15 @@ impl PlatformWindow for WaylandWindow {
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let state = self.borrow();
         state.client.update_ime_position(bounds);
+    }
+
+    fn restore_dead_key_state(&self, text: &str) {
+        let state = self.borrow();
+        let surface_id = state.surface.id();
+        let client = state.client.clone();
+        drop(state);
+
+        client.restore_dead_key_state(surface_id, text);
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

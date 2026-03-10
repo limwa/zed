@@ -719,6 +719,19 @@ pub(super) fn get_xkb_compose_state(cx: &xkb::Context) -> Option<xkb::compose::S
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn get_xkb_compose_state_for_locale(
+    cx: &xkb::Context,
+    locale: &OsString,
+) -> Option<xkb::compose::State> {
+    let table =
+        xkb::compose::Table::new_from_locale(cx, locale, xkb::compose::COMPILE_NO_FLAGS).ok()?;
+    Some(xkb::compose::State::new(
+        &table,
+        xkb::compose::STATE_NO_FLAGS,
+    ))
+}
+
+#[cfg(any(feature = "wayland", feature = "x11"))]
 pub(super) unsafe fn read_fd(fd: filedescriptor::FileDescriptor) -> Result<Vec<u8>> {
     let mut file = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
     let mut buffer = Vec::new();
