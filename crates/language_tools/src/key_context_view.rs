@@ -96,7 +96,7 @@ impl KeyContextView {
             cx.notify();
         });
         let sub2 = cx.observe_pending_input(window, |this, window, cx| {
-            this.pending_keystrokes = window.pending_input_keystrokes().map(|k| k.to_vec());
+            this.pending_keystrokes = window.pending_input_keystrokes();
             if this.pending_keystrokes.is_some() {
                 this.last_keystrokes.take();
             }

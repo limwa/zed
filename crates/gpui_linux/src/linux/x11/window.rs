@@ -1096,7 +1096,20 @@ impl X11WindowStatePtr {
             if event.keystroke.modifiers.is_subset_of(&Modifiers::shift()) {
                 let mut state = self.state.borrow_mut();
                 if let Some(mut input_handler) = state.input_handler.take() {
-                    if let Some(key_char) = &event.keystroke.key_char {
+                    if let Some(action) = &event.text_input_action {
+                        match action {
+                            gpui::TextInputAction::InsertText(text) => {
+                                drop(state);
+                                input_handler.replace_text_in_range(None, text);
+                                state = self.state.borrow_mut();
+                            }
+                            gpui::TextInputAction::SetMarkedText(text) => {
+                                drop(state);
+                                input_handler.replace_and_mark_text_in_range(None, text, None);
+                                state = self.state.borrow_mut();
+                            }
+                        }
+                    } else if let Some(key_char) = &event.keystroke.key_char {
                         drop(state);
                         input_handler.replace_text_in_range(None, key_char);
                         state = self.state.borrow_mut();

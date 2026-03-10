@@ -353,6 +353,7 @@ impl WebWindowInner {
                 keystroke,
                 is_held,
                 prefer_character_input: false,
+                text_input_action: None,
             }));
         })
     }

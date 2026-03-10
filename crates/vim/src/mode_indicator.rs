@@ -53,6 +53,7 @@ impl ModeIndicator {
     fn update_pending_keys(&mut self, window: &mut Window, cx: &App) {
         self.pending_keys = window
             .pending_input_keystrokes()
+            .as_ref()
             .map(|keystrokes| text_for_keystrokes(keystrokes, cx));
     }
 

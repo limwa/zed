@@ -92,8 +92,8 @@ use gpui::{
     ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
     Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, TaskTiming, TouchPhase, WindowParams, point,
-    profiler, px, size,
+    ScrollDelta, ScrollWheelEvent, SharedString, Size, TaskTiming, TextInputAction, TouchPhase,
+    WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -1465,11 +1465,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                     keystroke.key_char = None;
                                     state.pre_edit_text =
                                         compose.utf8().or(keystroke_underlying_dead_key(keysym));
-                                    let pre_edit =
-                                        state.pre_edit_text.clone().unwrap_or(String::default());
-                                    drop(state);
-                                    focused_window.handle_ime(ImeInput::SetMarkedText(pre_edit));
-                                    state = client.borrow_mut();
                                 }
 
                                 xkb::Status::Composed => {
@@ -1483,25 +1478,22 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                     let pre_edit = state.pre_edit_text.take();
                                     let new_pre_edit = keystroke_underlying_dead_key(keysym);
                                     state.pre_edit_text = new_pre_edit.clone();
-                                    drop(state);
-                                    if let Some(pre_edit) = pre_edit {
-                                        focused_window.handle_ime(ImeInput::InsertText(pre_edit));
-                                    }
-                                    if let Some(current_key) = new_pre_edit {
-                                        focused_window
-                                            .handle_ime(ImeInput::SetMarkedText(current_key));
-                                    }
                                     compose.feed(keysym);
-                                    state = client.borrow_mut();
+                                    keystroke.key_char = pre_edit;
                                 }
                                 _ => {}
                             }
                             state.compose_state = Some(compose);
                         }
+                        let text_input_action = state
+                            .pre_edit_text
+                            .clone()
+                            .map(TextInputAction::SetMarkedText);
                         let input = PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: keystroke.clone(),
                             is_held: false,
                             prefer_character_input: false,
+                            text_input_action,
                         });
 
                         state.repeat.current_id += 1;
@@ -1517,6 +1509,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                     keystroke,
                                     is_held: true,
                                     prefer_character_input: false,
+                                    text_input_action: None,
                                 });
                                 move |event_timestamp, _metadata, this| {
                                     let client = this.get_client();
@@ -1603,6 +1596,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                             },
                             is_held: false,
                             prefer_character_input: false,
+                            text_input_action: None,
                         }));
                     } else {
                         window.handle_ime(ImeInput::InsertText(commit_text));

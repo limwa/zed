@@ -51,7 +51,7 @@
 
 use crate::{
     Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
-    Keystroke, ModifiersChangedEvent, Window,
+    Keystroke, ModifiersChangedEvent, TextInputAction, Window,
 };
 use collections::FxHashMap;
 use smallvec::SmallVec;
@@ -114,13 +114,28 @@ impl ReusedSubtree {
 
 #[derive(Default, Debug)]
 pub(crate) struct Replay {
-    pub(crate) keystroke: Keystroke,
+    pub(crate) input: PendingKeystroke,
     pub(crate) bindings: SmallVec<[KeyBinding; 1]>,
+}
+
+#[derive(Default, Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PendingKeystroke {
+    pub(crate) keystroke: Keystroke,
+    pub(crate) text_input_action: Option<TextInputAction>,
+}
+
+impl PendingKeystroke {
+    pub(crate) fn from_keystroke(keystroke: Keystroke) -> Self {
+        Self {
+            keystroke,
+            text_input_action: None,
+        }
+    }
 }
 
 #[derive(Default, Debug)]
 pub(crate) struct DispatchResult {
-    pub(crate) pending: SmallVec<[Keystroke; 1]>,
+    pub(crate) pending: SmallVec<[PendingKeystroke; 1]>,
     pub(crate) pending_has_binding: bool,
     pub(crate) bindings: SmallVec<[KeyBinding; 1]>,
     pub(crate) to_replay: SmallVec<[Replay; 1]>,
@@ -447,7 +462,7 @@ impl DispatchTree {
 
     fn bindings_for_input(
         &self,
-        input: &[Keystroke],
+        input: &[PendingKeystroke],
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
     ) -> (SmallVec<[KeyBinding; 1]>, bool, Vec<KeyContext>) {
         let context_stack: Vec<KeyContext> = dispatch_path
@@ -455,10 +470,13 @@ impl DispatchTree {
             .filter_map(|node_id| self.node(*node_id).context.clone())
             .collect();
 
-        let (bindings, partial) = self
-            .keymap
-            .borrow()
-            .bindings_for_input(input, &context_stack);
+        let (bindings, partial) = self.keymap.borrow().bindings_for_input(
+            &input
+                .iter()
+                .map(|input| input.keystroke.clone())
+                .collect::<SmallVec<[Keystroke; 1]>>(),
+            &context_stack,
+        );
         (bindings, partial, context_stack)
     }
 
@@ -482,11 +500,11 @@ impl DispatchTree {
     ///   these should be replayed first.
     pub fn dispatch_key(
         &mut self,
-        mut input: SmallVec<[Keystroke; 1]>,
-        keystroke: Keystroke,
+        mut input: SmallVec<[PendingKeystroke; 1]>,
+        pending_keystroke: PendingKeystroke,
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
     ) -> DispatchResult {
-        input.push(keystroke.clone());
+        input.push(pending_keystroke.clone());
         let (bindings, pending, context_stack) = self.bindings_for_input(&input, dispatch_path);
 
         if pending {
@@ -512,7 +530,7 @@ impl DispatchTree {
 
         let (suffix, mut to_replay) = self.replay_prefix(input, dispatch_path);
 
-        let mut result = self.dispatch_key(suffix, keystroke, dispatch_path);
+        let mut result = self.dispatch_key(suffix, pending_keystroke, dispatch_path);
         to_replay.extend(result.to_replay);
         result.to_replay = to_replay;
         result
@@ -522,7 +540,7 @@ impl DispatchTree {
     /// flush_dispatch() converts any previously pending input to replay events.
     pub fn flush_dispatch(
         &mut self,
-        input: SmallVec<[Keystroke; 1]>,
+        input: SmallVec<[PendingKeystroke; 1]>,
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
     ) -> SmallVec<[Replay; 1]> {
         let (suffix, mut to_replay) = self.replay_prefix(input, dispatch_path);
@@ -537,15 +555,15 @@ impl DispatchTree {
     /// Converts the longest prefix of input to a replay event and returns the rest.
     fn replay_prefix(
         &self,
-        mut input: SmallVec<[Keystroke; 1]>,
+        mut input: SmallVec<[PendingKeystroke; 1]>,
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
-    ) -> (SmallVec<[Keystroke; 1]>, SmallVec<[Replay; 1]>) {
+    ) -> (SmallVec<[PendingKeystroke; 1]>, SmallVec<[Replay; 1]>) {
         let mut to_replay: SmallVec<[Replay; 1]> = Default::default();
         for last in (0..input.len()).rev() {
             let (bindings, _, _) = self.bindings_for_input(&input[0..=last], dispatch_path);
             if !bindings.is_empty() {
                 to_replay.push(Replay {
-                    keystroke: input.drain(0..=last).next_back().unwrap(),
+                    input: input.drain(0..=last).next_back().unwrap(),
                     bindings,
                 });
                 break;
@@ -553,7 +571,7 @@ impl DispatchTree {
         }
         if to_replay.is_empty() {
             to_replay.push(Replay {
-                keystroke: input.remove(0),
+                input: input.remove(0),
                 ..Default::default()
             });
         }
@@ -630,8 +648,8 @@ mod tests {
 
     use crate::{
         Action, ActionRegistry, App, Bounds, Context, DispatchTree, FocusHandle, InputHandler,
-        IntoElement, KeyBinding, KeyContext, Keymap, Pixels, Point, Render, Subscription,
-        TestAppContext, UTF16Selection, Window,
+        IntoElement, KeyBinding, KeyContext, Keymap, PendingKeystroke, Pixels, Point, Render,
+        Subscription, TestAppContext, TextInputAction, UTF16Selection, Window,
     };
 
     #[derive(PartialEq, Eq)]
@@ -706,11 +724,18 @@ mod tests {
         type DispatchPath = SmallVec<[super::DispatchNodeId; 32]>;
         fn dispatch(
             tree: &mut DispatchTree,
-            pending: SmallVec<[Keystroke; 1]>,
+            pending: SmallVec<[PendingKeystroke; 1]>,
             key: &str,
             path: &DispatchPath,
         ) -> DispatchResult {
-            tree.dispatch_key(pending, Keystroke::parse(key).unwrap(), path)
+            tree.dispatch_key(
+                pending,
+                PendingKeystroke {
+                    keystroke: Keystroke::parse(key).unwrap(),
+                    text_input_action: None,
+                },
+                path,
+            )
         }
 
         let dispatch_path: DispatchPath = SmallVec::new();
@@ -732,6 +757,32 @@ mod tests {
 
         assert_eq!(result.pending.len(), 1);
         assert!(!result.pending_has_binding);
+    }
+
+    #[test]
+    fn test_flush_replay_preserves_marked_text_action() {
+        let bindings = vec![KeyBinding::new("ctrl-k a", TestAction, None)];
+        let keymap = Rc::new(RefCell::new(Keymap::new(bindings)));
+        let mut registry = ActionRegistry::default();
+        registry.load_action::<TestAction>();
+        let mut tree = DispatchTree::new(keymap, Rc::new(registry));
+
+        type DispatchPath = SmallVec<[super::DispatchNodeId; 32]>;
+        let dispatch_path: DispatchPath = SmallVec::new();
+
+        let replay = tree.flush_dispatch(
+            SmallVec::from_iter([PendingKeystroke {
+                keystroke: Keystroke::parse("`").unwrap(),
+                text_input_action: Some(TextInputAction::SetMarkedText("~".into())),
+            }]),
+            &dispatch_path,
+        );
+
+        assert_eq!(replay.len(), 1);
+        assert_eq!(
+            replay[0].input.text_input_action,
+            Some(TextInputAction::SetMarkedText("~".into()))
+        );
     }
 
     #[crate::test]

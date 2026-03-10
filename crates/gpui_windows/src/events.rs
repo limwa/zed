@@ -365,6 +365,7 @@ impl WindowsWindowInner {
                     keystroke,
                     is_held: lparam.0 & (0x1 << 30) > 0,
                     prefer_character_input,
+                    text_input_action: None,
                 })
             },
         ) else {

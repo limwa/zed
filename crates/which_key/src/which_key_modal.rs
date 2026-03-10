@@ -65,7 +65,7 @@ impl WhichKeyModal {
             cx.emit(DismissEvent);
             return;
         };
-        let bindings = window.possible_bindings_for_input(pending_keys);
+        let bindings = window.possible_bindings_for_input(&pending_keys);
 
         let mut binding_data = bindings
             .iter()

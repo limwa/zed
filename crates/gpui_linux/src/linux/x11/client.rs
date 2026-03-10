@@ -1068,6 +1068,7 @@ impl X11Client {
                     keystroke,
                     is_held: false,
                     prefer_character_input: false,
+                    text_input_action: None,
                 }));
             }
             Event::KeyRelease(event) => {

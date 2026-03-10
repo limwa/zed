@@ -14,10 +14,10 @@ use crate::{
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    TaffyLayoutEngine, Task, TextInputAction, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -1017,7 +1017,7 @@ pub(crate) enum DrawPhase {
 
 #[derive(Default, Debug)]
 struct PendingInput {
-    keystrokes: SmallVec<[Keystroke; 1]>,
+    keystrokes: SmallVec<[crate::key_dispatch::PendingKeystroke; 1]>,
     focus: Option<FocusId>,
     timer: Option<Task<()>>,
     needs_timeout: bool,
@@ -3860,6 +3860,7 @@ impl Window {
                 keystroke: keystroke.clone(),
                 is_held: false,
                 prefer_character_input: false,
+                text_input_action: None,
             }),
             cx,
         );
@@ -4067,7 +4068,7 @@ impl Window {
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
         let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
 
-        let mut keystroke: Option<Keystroke> = None;
+        let mut pending_keystroke: Option<crate::key_dispatch::PendingKeystroke> = None;
 
         if let Some(event) = event.downcast_ref::<ModifiersChangedEvent>() {
             if event.modifiers.number_of_modifiers() == 0
@@ -4083,11 +4084,13 @@ impl Window {
                     _ => None,
                 };
                 if let Some(key) = key {
-                    keystroke = Some(Keystroke {
-                        key: key.to_string(),
-                        key_char: None,
-                        modifiers: Modifiers::default(),
-                    });
+                    pending_keystroke = Some(
+                        crate::key_dispatch::PendingKeystroke::from_keystroke(Keystroke {
+                            key: key.to_string(),
+                            key_char: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                    );
                 }
             }
 
@@ -4099,10 +4102,13 @@ impl Window {
             self.pending_modifier.modifiers = event.modifiers
         } else if let Some(key_down_event) = event.downcast_ref::<KeyDownEvent>() {
             self.pending_modifier.saw_keystroke = true;
-            keystroke = Some(key_down_event.keystroke.clone());
+            pending_keystroke = Some(crate::key_dispatch::PendingKeystroke {
+                keystroke: key_down_event.keystroke.clone(),
+                text_input_action: key_down_event.text_input_action.clone(),
+            });
         }
 
-        let Some(keystroke) = keystroke else {
+        let Some(pending_keystroke) = pending_keystroke else {
             self.finish_dispatch_key_event(event, dispatch_path, self.context_stack(), cx);
             return;
         };
@@ -4121,7 +4127,7 @@ impl Window {
 
         let match_result = self.rendered_frame.dispatch_tree.dispatch_key(
             currently_pending.keystrokes,
-            keystroke,
+            pending_keystroke,
             &dispatch_path,
         );
 
@@ -4306,10 +4312,14 @@ impl Window {
     }
 
     /// Returns the currently pending input keystrokes that might result in a multi-stroke key binding.
-    pub fn pending_input_keystrokes(&self) -> Option<&[Keystroke]> {
-        self.pending_input
-            .as_ref()
-            .map(|pending_input| pending_input.keystrokes.as_slice())
+    pub fn pending_input_keystrokes(&self) -> Option<Vec<Keystroke>> {
+        self.pending_input.as_ref().map(|pending_input| {
+            pending_input
+                .keystrokes
+                .iter()
+                .map(|pending_input| pending_input.keystroke.clone())
+                .collect()
+        })
     }
 
     fn replay_pending_input(&mut self, replays: SmallVec<[Replay; 1]>, cx: &mut App) {
@@ -4318,9 +4328,10 @@ impl Window {
 
         'replay: for replay in replays {
             let event = KeyDownEvent {
-                keystroke: replay.keystroke.clone(),
+                keystroke: replay.input.keystroke.clone(),
                 is_held: false,
                 prefer_character_input: true,
+                text_input_action: replay.input.text_input_action.clone(),
             };
 
             cx.propagate_event = true;
@@ -4341,12 +4352,30 @@ impl Window {
             if !cx.propagate_event {
                 continue 'replay;
             }
-            if let Some(input) = replay.keystroke.key_char.as_ref().cloned()
-                && let Some(mut input_handler) = self.platform_window.take_input_handler()
-            {
-                input_handler.dispatch_input(&input, self, cx);
-                self.platform_window.set_input_handler(input_handler)
+            self.apply_key_text_input(&event, cx);
+        }
+    }
+
+    fn apply_key_text_input(&mut self, event: &KeyDownEvent, cx: &mut App) {
+        if let Some(action) = event.text_input_action.as_ref() {
+            self.apply_text_input_action(action, cx);
+        } else if let Some(input) = event.keystroke.key_char.as_ref()
+            && let Some(mut input_handler) = self.platform_window.take_input_handler()
+        {
+            input_handler.dispatch_input(input, self, cx);
+            self.platform_window.set_input_handler(input_handler);
+        }
+    }
+
+    fn apply_text_input_action(&mut self, action: &TextInputAction, cx: &mut App) {
+        if let Some(mut input_handler) = self.platform_window.take_input_handler() {
+            match action {
+                TextInputAction::InsertText(text) => input_handler.dispatch_input(text, self, cx),
+                TextInputAction::SetMarkedText(text) => {
+                    input_handler.replace_and_mark_text_in_range(None, text, None)
+                }
             }
+            self.platform_window.set_input_handler(input_handler);
         }
     }
 

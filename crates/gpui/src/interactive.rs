@@ -17,6 +17,15 @@ pub trait KeyEvent: InputEvent {}
 /// A mouse event from the platform.
 pub trait MouseEvent: InputEvent {}
 
+/// Text input that should be applied if a key press resolves to text instead of a binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextInputAction {
+    /// Insert text into the focused input handler.
+    InsertText(String),
+    /// Mark text as part of an IME or dead-key preedit.
+    SetMarkedText(String),
+}
+
 /// The key down event equivalent for the platform.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyDownEvent {
@@ -29,6 +38,9 @@ pub struct KeyDownEvent {
     /// Whether to prefer character input over keybindings for this keystroke.
     /// In some cases, like AltGr on Windows, modifiers are significant for character input.
     pub prefer_character_input: bool,
+
+    /// Deferred text input to apply if this key press is treated as text instead of a binding.
+    pub text_input_action: Option<TextInputAction>,
 }
 
 impl Sealed for KeyDownEvent {}

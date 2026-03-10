@@ -998,12 +998,22 @@ impl WaylandWindowStatePtr {
         }
         if let PlatformInput::KeyDown(event) = input
             && event.keystroke.modifiers.is_subset_of(&Modifiers::shift())
-            && let Some(key_char) = &event.keystroke.key_char
         {
             let mut state = self.state.borrow_mut();
             if let Some(mut input_handler) = state.input_handler.take() {
                 drop(state);
-                input_handler.replace_text_in_range(None, key_char);
+                if let Some(action) = &event.text_input_action {
+                    match action {
+                        gpui::TextInputAction::InsertText(text) => {
+                            input_handler.replace_text_in_range(None, text)
+                        }
+                        gpui::TextInputAction::SetMarkedText(text) => {
+                            input_handler.replace_and_mark_text_in_range(None, text, None)
+                        }
+                    }
+                } else if let Some(key_char) = &event.keystroke.key_char {
+                    input_handler.replace_text_in_range(None, key_char);
+                }
                 self.state.borrow_mut().input_handler = Some(input_handler);
             }
         }
