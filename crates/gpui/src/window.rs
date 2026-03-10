@@ -928,6 +928,7 @@ pub struct Window {
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
+    key_dispatch_outcome: Option<KeyDispatchOutcome>,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
@@ -1416,6 +1417,7 @@ impl Window {
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
+            key_dispatch_outcome: None,
             mouse_position,
             mouse_hit_test: HitTest::default(),
             modifiers,
@@ -3919,6 +3921,7 @@ impl Window {
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
+        self.key_dispatch_outcome = None;
 
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
@@ -4013,28 +4016,7 @@ impl Window {
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
-            key_dispatch_outcome: self.key_dispatch_outcome_for_event(&event),
-        }
-    }
-
-    fn key_dispatch_outcome_for_event(&self, event: &PlatformInput) -> Option<KeyDispatchOutcome> {
-        match event {
-            PlatformInput::KeyDown(key_down) => {
-                if self.pending_input.as_ref().is_some_and(|pending| {
-                    pending.focus == self.focus
-                        && pending
-                            .keystrokes
-                            .last()
-                            .is_some_and(|pending| pending.keystroke == key_down.keystroke)
-                }) {
-                    Some(KeyDispatchOutcome::PendingBinding)
-                } else if self.default_prevented {
-                    Some(KeyDispatchOutcome::HandledBinding)
-                } else {
-                    Some(KeyDispatchOutcome::Unhandled)
-                }
-            }
-            _ => None,
+            key_dispatch_outcome: self.key_dispatch_outcome,
         }
     }
 
@@ -4147,6 +4129,7 @@ impl Window {
         cx.propagate_event = true;
         self.dispatch_keystroke_interceptors(event, self.context_stack(), cx);
         if !cx.propagate_event {
+            self.key_dispatch_outcome = Some(KeyDispatchOutcome::HandledBinding);
             self.finish_dispatch_key_event(event, dispatch_path, self.context_stack(), cx);
             return;
         }
@@ -4215,6 +4198,7 @@ impl Window {
                 currently_pending.timer = None;
             }
             self.pending_input = Some(currently_pending);
+            self.key_dispatch_outcome = Some(KeyDispatchOutcome::PendingBinding);
             self.pending_input_changed(cx);
             cx.propagate_event = false;
             return;
@@ -4240,6 +4224,7 @@ impl Window {
             for binding in match_result.bindings {
                 self.dispatch_action_on_node(node_id, binding.action.as_ref(), cx);
                 if !cx.propagate_event {
+                    self.key_dispatch_outcome = Some(KeyDispatchOutcome::HandledBinding);
                     self.dispatch_keystroke_observers(
                         event,
                         Some(binding.action),
@@ -4252,6 +4237,7 @@ impl Window {
             }
         }
 
+        self.key_dispatch_outcome = Some(KeyDispatchOutcome::Unhandled);
         self.finish_dispatch_key_event(event, dispatch_path, match_result.context_stack, cx);
         self.pending_input_changed(cx);
     }

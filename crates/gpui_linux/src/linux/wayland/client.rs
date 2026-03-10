@@ -1541,6 +1541,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             && dispatch_result.key_dispatch_outcome
                                 == Some(gpui::KeyDispatchOutcome::HandledBinding)
                         {
+                            eprintln!(
+                                "[dead-key-fix] resetting compose after handled dead-key shortcut"
+                            );
                             let mut state = client.borrow_mut();
                             if let Some(compose) = state.compose_state.as_mut() {
                                 compose.reset();
