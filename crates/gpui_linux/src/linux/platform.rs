@@ -779,6 +779,11 @@ pub(super) fn log_cursor_icon_warning(message: impl std::fmt::Display) {
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn layout_independent_key(keycode: Keycode, shift: bool) -> Option<String> {
+    guess_ascii(keycode, shift).map(String::from)
+}
+
+#[cfg(any(feature = "wayland", feature = "x11"))]
 fn guess_ascii(keycode: Keycode, shift: bool) -> Option<char> {
     let c = match (keycode.raw(), shift) {
         (24, _) => 'q',
@@ -929,8 +934,8 @@ pub(super) fn keystroke_from_xkb(
                 } else {
                     name
                 }
-            } else if let Some(key_en) = guess_ascii(keycode, modifiers.shift) {
-                String::from(key_en)
+            } else if let Some(key) = layout_independent_key(keycode, modifiers.shift) {
+                key
             } else {
                 name
             }
@@ -1098,5 +1103,17 @@ mod tests {
             zero,
             Point::new(px(5.0), px(5.1))
         ),);
+    }
+
+    #[test]
+    fn test_layout_independent_backslash_key() {
+        assert_eq!(
+            layout_independent_key(Keycode::from(51_u32), false),
+            Some("\\".into())
+        );
+        assert_eq!(
+            layout_independent_key(Keycode::from(51_u32), true),
+            Some("|".into())
+        );
     }
 }
