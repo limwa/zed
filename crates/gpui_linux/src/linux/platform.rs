@@ -841,6 +841,9 @@ pub(super) fn keystroke_from_xkb(
     let key_utf32 = state.key_get_utf32(keycode);
     let key_utf8 = state.key_get_utf8(keycode);
     let key_sym = state.key_get_one_sym(keycode);
+    let key_index = state.key_get_layout(keycode);
+    
+    eprintln!("[dead-key-debug] keystroke_from_kxb keycode={:?} key_utf32={:?} key_utf8={:?} key_sym={:?} key_index={:?}", keycode, key_utf32, key_utf8, key_sym, key_index);
 
     let key = match key_sym {
         Keysym::Return => "enter".to_owned(),
