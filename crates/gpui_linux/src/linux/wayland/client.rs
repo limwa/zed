@@ -1468,6 +1468,15 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
+                let debug_compose_key = true; 
+                
+                let tmp_keystroke =
+                    keystroke_from_xkb(keymap_state, state.modifiers, keycode);
+                
+                eprintln!(
+                    "[dead-key-debug] wl_keyboard key event keycode={:?} keysym={} key={} key_char={:?} pre_edit_text={:?}",
+                    keycode, xkb::keysym_get_name(keysym), tmp_keystroke.key, tmp_keystroke.key_char, state.pre_edit_text,
+                );
 
                 match key_state {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
@@ -1480,6 +1489,19 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                     keystroke.key_char = None;
                                     state.pre_edit_text =
                                         compose.utf8().or(keystroke_underlying_dead_key(keysym));
+                                    
+                                    if debug_compose_key {
+                                        eprintln!(
+                                            "[dead-key-debug] wl_keyboard press before compose keycode={:?} keysym={} modifiers={:?} key={} key_char={:?} pre_edit_text={:?}",
+                                            keycode,
+                                            xkb::keysym_get_name(keysym),
+                                            state.modifiers,
+                                            keystroke.key,
+                                            keystroke.key_char,
+                                            state.pre_edit_text,
+                                        );
+                                    }
+                                    
                                     let pre_edit =
                                         state.pre_edit_text.clone().unwrap_or(String::default());
                                     drop(state);
@@ -1493,12 +1515,21 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                     if let Some(keysym) = compose.keysym() {
                                         keystroke.key = xkb::keysym_get_name(keysym);
                                     }
+                                    
+                                    if debug_compose_key {
+                                        eprintln!(
+                                            "[dead-key-debug] compose status=Composed keysym={} key={} key_char={:?} pre_edit_text={:?}",
+                                            xkb::keysym_get_name(keysym),
+                                            keystroke.key,
+                                            keystroke.key_char,
+                                            state.pre_edit_text,
+                                        );
+                                    }
                                 }
                                 xkb::Status::Cancelled => {
                                     let pre_edit = state.pre_edit_text.take();
                                     let new_pre_edit = keystroke_underlying_dead_key(keysym);
                                     state.pre_edit_text = new_pre_edit.clone();
-                                    drop(state);
                                     if let Some(pre_edit) = pre_edit {
                                         focused_window.handle_ime(ImeInput::InsertText(pre_edit));
                                     }
@@ -1507,9 +1538,33 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                             .handle_ime(ImeInput::SetMarkedText(current_key));
                                     }
                                     compose.feed(keysym);
+                                    
+                                    if debug_compose_key {
+                                        eprintln!(
+                                            "[dead-key-debug] compose status=Cancelled keysym={} key={} key_char={:?} old_pre_edit={:?} new_pre_edit={:?}",
+                                            xkb::keysym_get_name(keysym),
+                                            keystroke.key,
+                                            keystroke.key_char,
+                                            keystroke_underlying_dead_key(keysym),
+                                            state.pre_edit_text,
+                                        );
+                                    }
+                                    drop(state);
+                                    
                                     state = client.borrow_mut();
                                 }
-                                _ => {}
+                                status => {
+                                    if debug_compose_key {
+                                        eprintln!(
+                                            "[dead-key-debug] compose status={:?} keysym={} key={} key_char={:?} pre_edit_text={:?}",
+                                            status,
+                                            xkb::keysym_get_name(keysym),
+                                            keystroke.key,
+                                            keystroke.key_char,
+                                            state.pre_edit_text,
+                                        );
+                                    }
+                                }
                             }
                             state.compose_state = Some(compose);
                         }
@@ -1518,6 +1573,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             is_held: false,
                             prefer_character_input: false,
                         });
+                        
+                        eprintln!(
+                            "[dead-key-debug] keydown keysym={} key={} key_char={:?} pre_edit_text={:?}",
+                            xkb::keysym_get_name(keysym),
+                            keystroke.key,
+                            keystroke.key_char,
+                            state.pre_edit_text,
+                        );
 
                         state.repeat.current_id += 1;
                         state.repeat.current_keycode = Some(keycode);
@@ -1600,6 +1663,11 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 this.disable_ime();
             }
             zwp_text_input_v3::Event::CommitString { text } => {
+                eprintln!(
+                    "[dead-key-debug] text_input_v3 CommitString text={:?} composing={} ime_pre_edit={:?} pre_edit_text={:?}",
+                    text, state.composing, state.ime_pre_edit, state.pre_edit_text,
+                );
+                                
                 state.composing = false;
                 let Some(window) = state.keyboard_focused_window.clone() else {
                     return;
@@ -1625,10 +1693,20 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 }
             }
             zwp_text_input_v3::Event::PreeditString { text, .. } => {
+                eprintln!(
+                    "[dead-key-debug] text_input_v3 PreeditString text={:?} composing={} pre_edit_text={:?}",
+                    text, state.composing, state.pre_edit_text,
+                );
+                                
                 state.composing = true;
                 state.ime_pre_edit = text;
             }
             zwp_text_input_v3::Event::Done { serial } => {
+                eprintln!(
+                    "[dead-key-debug] text_input_v3 Done serial={} ime_pre_edit={:?} pre_edit_text={:?} composing={}",
+                    serial, state.ime_pre_edit, state.pre_edit_text, state.composing,
+                );
+                                
                 let last_serial = state.serial_tracker.get(SerialKind::InputMethod);
                 state.serial_tracker.update(SerialKind::InputMethod, serial);
                 let Some(window) = state.keyboard_focused_window.clone() else {
