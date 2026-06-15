@@ -22,7 +22,7 @@ use clap::Parser;
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
 use client::{Client, ProxySettings, RefreshLlmTokenListener, UserStore, parse_zed_link};
 use collab_ui::channel_view::ChannelView;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use crashes::InitCrashHandler;
 use db::kvp::{GlobalKeyValueStore, KeyValueStore};
 use editor::Editor;
@@ -32,7 +32,7 @@ use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, Focusable as _, QuitMode, Task, TaskExt,
+    App, AppContext, Application, AsyncApp, Focusable as _, QuitMode, SharedString, Task, TaskExt,
     UpdateGlobal as _, block_on,
 };
 use gpui_platform;
@@ -65,8 +65,8 @@ use std::{
     sync::{Arc, LazyLock, OnceLock},
     time::Instant,
 };
-use theme::{ActiveTheme, GlobalTheme, ThemeRegistry};
-use theme_settings::load_user_theme;
+use theme::{ActiveTheme, GlobalTheme, Theme, ThemeRegistry};
+use theme_settings::{deserialize_user_theme, refine_theme_family};
 use util::{ResultExt, TryFutureExt, maybe};
 use uuid::Uuid;
 use workspace::{
@@ -839,7 +839,6 @@ fn main() {
         telemetry.flush_events().detach();
 
         let fs = app_state.fs.clone();
-        load_user_themes_in_background(fs.clone(), cx);
         watch_themes(fs.clone(), cx);
         #[cfg(debug_assertions)]
         watch_languages(fs.clone(), app_state.languages.clone(), cx);
@@ -1923,75 +1922,300 @@ fn load_embedded_fonts(cx: &App) {
         .unwrap();
 }
 
-/// Spawns a background task to load the user themes from the themes directory.
-fn load_user_themes_in_background(fs: Arc<dyn fs::Fs>, cx: &mut App) {
-    cx.spawn({
-        let fs = fs.clone();
-        async move |cx| {
-            let theme_registry = cx.update(|cx| ThemeRegistry::global(cx));
-            let themes_dir = paths::themes_dir().as_ref();
-            match fs
-                .metadata(themes_dir)
-                .await
-                .ok()
-                .flatten()
-                .map(|m| m.is_dir)
-            {
-                Some(is_dir) => {
-                    anyhow::ensure!(is_dir, "Themes dir path {themes_dir:?} is not a directory")
-                }
-                None => {
-                    fs.create_dir(themes_dir).await.with_context(|| {
-                        format!("Failed to create themes dir at path {themes_dir:?}")
-                    })?;
-                }
-            }
-
-            let mut theme_paths = fs
-                .read_dir(themes_dir)
-                .await
-                .with_context(|| format!("reading themes from {themes_dir:?}"))?;
-
-            while let Some(theme_path) = theme_paths.next().await {
-                let Some(theme_path) = theme_path.log_err() else {
-                    continue;
-                };
-                let Some(bytes) = fs.load_bytes(&theme_path).await.log_err() else {
-                    continue;
-                };
-
-                load_user_theme(&theme_registry, &bytes).log_err();
-            }
-
-            cx.update(theme_settings::reload_theme);
-            anyhow::Ok(())
-        }
-    })
-    .detach_and_log_err(cx);
-}
-
 /// Spawns a background task to watch the themes directory for changes.
 fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     use std::time::Duration;
     cx.spawn(async move |cx| {
+        let theme_registry = cx.update(|cx| ThemeRegistry::global(cx));
         let (mut events, _) = fs
             .watch(paths::themes_dir(), Duration::from_millis(100))
             .await;
+        let mut user_themes = UserThemeStore::default();
+        load_user_themes_from_directory(&fs, &theme_registry, &mut user_themes)
+            .await
+            .log_err();
 
-        while let Some(paths) = events.next().await {
-            for event in paths {
-                if fs.metadata(&event.path).await.ok().flatten().is_some() {
-                    let theme_registry = cx.update(|cx| ThemeRegistry::global(cx));
-                    if let Some(bytes) = fs.load_bytes(&event.path).await.log_err()
-                        && load_user_theme(&theme_registry, &bytes).log_err().is_some()
-                    {
-                        cx.update(theme_settings::reload_theme);
-                    }
+        while let Some(events) = events.next().await {
+            if events.iter().any(|event| {
+                event.path == *paths::themes_dir() && event.kind == Some(fs::PathEventKind::Rescan)
+            }) {
+                reload_user_themes_from_directory(&fs, &theme_registry, &mut user_themes).await;
+                cx.update(theme_settings::reload_theme);
+                continue;
+            }
+
+            for event in events {
+                user_themes.unload_path(&event.path, &theme_registry);
+                if let Some(bytes) = fs.load_bytes(&event.path).await.log_err()
+                    && let Some(theme_family) = deserialize_user_theme(&bytes).log_err()
+                {
+                    user_themes.load_theme_family(
+                        event.path,
+                        refine_theme_family(theme_family),
+                        &theme_registry,
+                    );
                 }
+                cx.update(theme_settings::reload_theme);
             }
         }
     })
     .detach()
+}
+
+async fn load_user_themes_from_directory(
+    fs: &Arc<dyn fs::Fs>,
+    theme_registry: &ThemeRegistry,
+    user_themes: &mut UserThemeStore,
+) -> Result<()> {
+    let themes_dir = paths::themes_dir().as_ref();
+    match fs
+        .metadata(themes_dir)
+        .await
+        .ok()
+        .flatten()
+        .map(|metadata| metadata.is_dir)
+    {
+        Some(is_dir) => {
+            anyhow::ensure!(is_dir, "Themes dir path {themes_dir:?} is not a directory")
+        }
+        None => {
+            fs.create_dir(themes_dir)
+                .await
+                .with_context(|| format!("Failed to create themes dir at path {themes_dir:?}"))?;
+        }
+    }
+
+    let mut theme_paths = fs
+        .read_dir(themes_dir)
+        .await
+        .with_context(|| format!("reading themes from {themes_dir:?}"))?;
+    while let Some(theme_path) = theme_paths.next().await {
+        let Some(theme_path) = theme_path.log_err() else {
+            continue;
+        };
+        let Some(bytes) = fs.load_bytes(&theme_path).await.log_err() else {
+            continue;
+        };
+        let Some(theme_family) = deserialize_user_theme(&bytes).log_err() else {
+            continue;
+        };
+        user_themes.load_theme_family(
+            theme_path,
+            refine_theme_family(theme_family),
+            theme_registry,
+        );
+    }
+    Ok(())
+}
+
+async fn reload_user_themes_from_directory(
+    fs: &Arc<dyn fs::Fs>,
+    theme_registry: &ThemeRegistry,
+    user_themes: &mut UserThemeStore,
+) {
+    user_themes.clear(theme_registry);
+    load_user_themes_from_directory(fs, theme_registry, user_themes)
+        .await
+        .log_err();
+}
+
+#[derive(Default)]
+struct UserThemeStore {
+    theme_names_by_path: HashMap<PathBuf, Vec<SharedString>>,
+    layers_by_name: HashMap<SharedString, UserThemeLayers>,
+}
+
+#[derive(Default)]
+struct UserThemeLayers {
+    base_theme: Option<Theme>,
+    user_themes: Vec<UserThemeLayer>,
+}
+
+struct UserThemeLayer {
+    path: PathBuf,
+    theme: Theme,
+}
+
+impl UserThemeStore {
+    fn load_theme_family(
+        &mut self,
+        path: PathBuf,
+        theme_family: theme::ThemeFamily,
+        theme_registry: &ThemeRegistry,
+    ) {
+        for theme in theme_family.themes {
+            self.load_theme(path.clone(), theme, theme_registry);
+        }
+    }
+
+    fn load_theme(&mut self, path: PathBuf, theme: Theme, theme_registry: &ThemeRegistry) {
+        let name = theme.name.clone();
+        let layers = self
+            .layers_by_name
+            .entry(name.clone())
+            .or_insert_with(|| UserThemeLayers {
+                base_theme: theme_registry
+                    .get(name.as_ref())
+                    .ok()
+                    .map(|theme| theme.as_ref().clone()),
+                user_themes: Vec::new(),
+            });
+        layers.user_themes.push(UserThemeLayer {
+            path: path.clone(),
+            theme: theme.clone(),
+        });
+        self.theme_names_by_path.entry(path).or_default().push(name);
+        theme_registry.insert_themes([theme]);
+    }
+
+    fn unload_path(&mut self, path: &Path, theme_registry: &ThemeRegistry) {
+        let Some(theme_names) = self.theme_names_by_path.remove(path) else {
+            return;
+        };
+        let mut affected_theme_names = HashSet::default();
+        for theme_name in theme_names {
+            if affected_theme_names.insert(theme_name.clone())
+                && let Some(layers) = self.layers_by_name.get_mut(&theme_name)
+            {
+                layers.user_themes.retain(|layer| layer.path != path);
+            }
+        }
+
+        for theme_name in affected_theme_names {
+            self.apply_theme(theme_name, theme_registry);
+        }
+    }
+
+    fn clear(&mut self, theme_registry: &ThemeRegistry) {
+        let layers_by_name = std::mem::take(&mut self.layers_by_name);
+        self.theme_names_by_path.clear();
+        for (theme_name, layers) in layers_by_name {
+            theme_registry.remove_user_themes(std::slice::from_ref(&theme_name));
+            if let Some(base_theme) = layers.base_theme {
+                theme_registry.insert_themes([base_theme]);
+            }
+        }
+    }
+
+    fn apply_theme(&mut self, theme_name: SharedString, theme_registry: &ThemeRegistry) {
+        let Some(layers) = self.layers_by_name.get(&theme_name) else {
+            return;
+        };
+        if let Some(user_theme) = layers.user_themes.last() {
+            theme_registry.insert_themes([user_theme.theme.clone()]);
+            return;
+        }
+
+        let base_theme = layers.base_theme.clone();
+        theme_registry.remove_user_themes(std::slice::from_ref(&theme_name));
+        if let Some(base_theme) = base_theme {
+            theme_registry.insert_themes([base_theme]);
+        }
+        self.layers_by_name.remove(&theme_name);
+    }
+}
+
+#[cfg(test)]
+mod theme_watch_tests {
+    use super::*;
+    use fs::{FakeFs, RemoveOptions};
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    async fn test_root_rescan_replaces_user_directory_themes(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        let themes_dir = paths::themes_dir();
+        let old_theme_path = themes_dir.join("old.json");
+        fs.create_dir(themes_dir.as_ref()).await.unwrap();
+        fs.insert_file(
+            &old_theme_path,
+            br#"{
+                "name": "Old family",
+                "author": "Zed",
+                "themes": [{"name": "Old user theme", "appearance": "dark", "style": {}}]
+            }"#
+            .to_vec(),
+        )
+        .await;
+
+        let registry = ThemeRegistry::default();
+        let default_theme_name = registry.list_names().into_iter().next().unwrap();
+        let fs_trait: Arc<dyn fs::Fs> = fs.clone();
+        let mut user_themes = UserThemeStore::default();
+        load_user_themes_from_directory(&fs_trait, &registry, &mut user_themes)
+            .await
+            .unwrap();
+        assert!(registry.get("Old user theme").is_ok());
+
+        let new_theme_path = themes_dir.join("new.json");
+        fs.remove_file(&old_theme_path, RemoveOptions::default())
+            .await
+            .unwrap();
+        fs.insert_file(
+            &new_theme_path,
+            br#"{
+                "name": "New family",
+                "author": "Zed",
+                "themes": [{"name": "New user theme", "appearance": "light", "style": {}}]
+            }"#
+            .to_vec(),
+        )
+        .await;
+
+        reload_user_themes_from_directory(&fs_trait, &registry, &mut user_themes).await;
+
+        assert!(registry.get("Old user theme").is_err());
+        assert!(registry.get("New user theme").is_ok());
+        assert!(registry.get(&default_theme_name).is_ok());
+        assert_eq!(user_themes.theme_names_by_path.len(), 1);
+        assert!(
+            user_themes
+                .theme_names_by_path
+                .contains_key(&new_theme_path)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_deleting_user_override_of_default_theme_keeps_theme_available(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        let themes_dir = paths::themes_dir();
+        fs.create_dir(themes_dir.as_ref()).await.unwrap();
+
+        let registry = cx.update(|cx| {
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            watch_themes(fs.clone(), cx);
+            ThemeRegistry::global(cx)
+        });
+        cx.run_until_parked();
+
+        let bundled_theme = registry.get(theme::DEFAULT_DARK_THEME).unwrap();
+        let override_path = themes_dir.join("override.json");
+        fs.insert_file(
+            &override_path,
+            br#"{
+                "name": "Override family",
+                "author": "Zed",
+                "themes": [{"name": "One Dark", "appearance": "dark", "style": {}}]
+            }"#
+            .to_vec(),
+        )
+        .await;
+        cx.run_until_parked();
+
+        let user_theme = registry.get(theme::DEFAULT_DARK_THEME).unwrap();
+        assert!(!Arc::ptr_eq(&bundled_theme, &user_theme));
+
+        fs.remove_file(&override_path, RemoveOptions::default())
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let restored_theme = registry.get(theme::DEFAULT_DARK_THEME).unwrap();
+        assert_eq!(bundled_theme.as_ref(), restored_theme.as_ref());
+    }
 }
 
 #[cfg(debug_assertions)]
