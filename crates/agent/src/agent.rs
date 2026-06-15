@@ -59,7 +59,7 @@ use prompt_store::{ProjectContext, RULES_FILE_NAMES, RulesFileContext, WorktreeC
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use util::ResultExt;
@@ -645,27 +645,29 @@ impl NativeAgent {
             .watch(&skills_dir, std::time::Duration::from_millis(500))
             .await;
 
-        // Linux's inotify backend is non-recursive, so a watch on
-        // `skills_dir` only fires for direct children. Skill discovery
-        // is intentionally one level deep (`<skills_dir>/<skill>/SKILL.md`),
-        // so we only register watches on each immediate child directory
-        // and deliberately do NOT recurse: a stray `node_modules`,
-        // `target`, or `.git` inside a skill folder would otherwise
-        // register watches for tens of thousands of subdirectories.
-        // These per-child adds are cheap no-ops on macOS/Windows where
-        // the OS-level watch is already recursive.
-        if let Ok(mut entries) = fs.read_dir(&skills_dir).await {
-            while let Some(entry) = entries.next().await {
-                let Ok(path) = entry else { continue };
-                if let Ok(Some(metadata)) = fs.metadata(&path).await
-                    && metadata.is_dir
-                {
-                    watcher.add(&path).ok();
-                }
-            }
-        }
+        let mut watched_skill_dirs = HashSet::default();
+        Self::reconcile_skill_directory_watches(
+            &fs,
+            &skills_dir,
+            &watcher,
+            &mut watched_skill_dirs,
+        )
+        .await;
 
         while let Some(events) = events.next().await {
+            let root_was_rescanned = events.iter().any(|event| {
+                event.path == skills_dir && event.kind == Some(fs::PathEventKind::Rescan)
+            });
+            if root_was_rescanned {
+                Self::reconcile_skill_directory_watches(
+                    &fs,
+                    &skills_dir,
+                    &watcher,
+                    &mut watched_skill_dirs,
+                )
+                .await;
+            }
+
             // When a new immediate child directory of `skills_dir` is
             // created, add a single watch for it so changes to its
             // `SKILL.md` are observed on Linux. We intentionally do not
@@ -676,13 +678,20 @@ impl NativeAgent {
                     && event.path.parent() == Some(skills_dir.as_path())
                     && fs.is_dir(&event.path).await
                 {
-                    watcher.add(&event.path).ok();
+                    if watcher.add(&event.path).log_err().is_some() {
+                        watched_skill_dirs.insert(event.path.clone());
+                    }
+                } else if event.kind == Some(fs::PathEventKind::Removed)
+                    && event.path.parent() == Some(skills_dir.as_path())
+                    && watched_skill_dirs.remove(&event.path)
+                {
+                    watcher.remove(&event.path).log_err();
                 }
             }
 
             let watched_root_removed = events.iter().any(|event| {
                 event.path == skills_dir && event.kind == Some(fs::PathEventKind::Removed)
-            });
+            }) || (root_was_rescanned && !fs.is_dir(&skills_dir).await);
 
             let updated = this.update(cx, |this, _cx| {
                 for state in this.projects.values_mut() {
@@ -699,6 +708,33 @@ impl NativeAgent {
                 return;
             }
         }
+    }
+
+    async fn reconcile_skill_directory_watches(
+        fs: &Arc<dyn Fs>,
+        skills_dir: &Path,
+        watcher: &Arc<dyn fs::Watcher>,
+        watched_skill_dirs: &mut HashSet<PathBuf>,
+    ) {
+        let mut current_skill_dirs = HashSet::default();
+        if let Ok(mut entries) = fs.read_dir(skills_dir).await {
+            while let Some(entry) = entries.next().await {
+                let Some(path) = entry.log_err() else {
+                    continue;
+                };
+                if fs.is_dir(&path).await {
+                    current_skill_dirs.insert(path);
+                }
+            }
+        }
+
+        for path in current_skill_dirs.difference(watched_skill_dirs) {
+            watcher.add(path).log_err();
+        }
+        for path in watched_skill_dirs.difference(&current_skill_dirs) {
+            watcher.remove(path).log_err();
+        }
+        *watched_skill_dirs = current_skill_dirs;
     }
 
     pub fn set_sibling_thread_host(&mut self, host: Rc<dyn SiblingThreadHost>) {
@@ -3644,7 +3680,7 @@ mod internal_tests {
     use super::*;
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
     use agent_settings::COMPACTION_PROMPT;
-    use fs::FakeFs;
+    use fs::{FakeFs, RemoveOptions};
     use gpui::TestAppContext;
     use indoc::formatdoc;
     use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
@@ -4424,6 +4460,105 @@ mod internal_tests {
             assert_eq!(user.len(), 1);
             assert_eq!(user[0].description, "Second version");
         });
+
+        let replacement_skill_dir = skills_dir.join("replacement-skill");
+        let replacement_skill_path = replacement_skill_dir.join("SKILL.md");
+        fs.pause_events();
+        fs.remove_dir(
+            &initial_skill_dir,
+            RemoveOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        fs.create_dir(&replacement_skill_dir).await.unwrap();
+        fs.insert_file(
+            &replacement_skill_path,
+            b"---\nname: replacement-skill\ndescription: Recovered\n---\n\nbody".to_vec(),
+        )
+        .await;
+        fs.clear_buffered_events();
+        fs.emit_fs_event(&skills_dir, Some(fs::PathEventKind::Rescan));
+        fs.unpause_events_and_flush();
+        cx.run_until_parked();
+
+        agent.read_with(cx, |agent, _cx| {
+            let state = agent.projects.get(&project.entity_id()).unwrap();
+            let user = user_skills(&state.skills);
+            assert_eq!(user.len(), 1);
+            assert_eq!(user[0].name, "replacement-skill");
+            assert_eq!(user[0].description, "Recovered");
+        });
+        let watched_paths = fs.watched_paths();
+        assert!(watched_paths.contains(&skills_dir));
+    }
+
+    #[gpui::test]
+    async fn test_skill_watch_reconciliation_adds_before_removing(cx: &mut TestAppContext) {
+        #[derive(Default)]
+        struct RecordingWatcher {
+            paths: parking_lot::Mutex<HashSet<PathBuf>>,
+            operations: parking_lot::Mutex<Vec<(bool, PathBuf)>>,
+        }
+
+        impl fs::Watcher for RecordingWatcher {
+            fn add(&self, path: &Path) -> Result<()> {
+                self.paths.lock().insert(path.to_path_buf());
+                self.operations.lock().push((true, path.to_path_buf()));
+                Ok(())
+            }
+
+            fn remove(&self, path: &Path) -> Result<()> {
+                self.paths.lock().remove(path);
+                self.operations.lock().push((false, path.to_path_buf()));
+                Ok(())
+            }
+        }
+
+        let fs = FakeFs::new(cx.executor());
+        let skills_dir = PathBuf::from("/skills");
+        let old_skill_dir = skills_dir.join("old");
+        let new_skill_dir = skills_dir.join("new");
+        fs.create_dir(&old_skill_dir).await.unwrap();
+        let fs_trait: Arc<dyn Fs> = fs.clone();
+        let watcher = Arc::new(RecordingWatcher::default());
+        let watcher_trait: Arc<dyn fs::Watcher> = watcher.clone();
+        let mut watched_skill_dirs = HashSet::default();
+
+        NativeAgent::reconcile_skill_directory_watches(
+            &fs_trait,
+            &skills_dir,
+            &watcher_trait,
+            &mut watched_skill_dirs,
+        )
+        .await;
+        watcher.operations.lock().clear();
+
+        fs.remove_dir(
+            &old_skill_dir,
+            RemoveOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        fs.create_dir(&new_skill_dir).await.unwrap();
+        NativeAgent::reconcile_skill_directory_watches(
+            &fs_trait,
+            &skills_dir,
+            &watcher_trait,
+            &mut watched_skill_dirs,
+        )
+        .await;
+
+        assert_eq!(
+            *watcher.operations.lock(),
+            vec![(true, new_skill_dir.clone()), (false, old_skill_dir)]
+        );
+        assert_eq!(*watcher.paths.lock(), HashSet::from_iter([new_skill_dir]));
     }
 
     #[gpui::test]
