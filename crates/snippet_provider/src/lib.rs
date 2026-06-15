@@ -11,7 +11,7 @@ use std::{
 use anyhow::Result;
 use collections::{BTreeMap, BTreeSet, HashMap};
 use format::VsSnippetsFile;
-use fs::Fs;
+use fs::{Fs, PathEventKind};
 use futures::stream::StreamExt;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 pub use registry::*;
@@ -194,10 +194,20 @@ impl SnippetProvider {
             let fs = this.read_with(cx, |this, _| this.fs.clone())?;
             let watched_path = path.clone();
             let watcher = fs.watch(&watched_path, Duration::from_secs(1));
-            initial_scan(this.clone(), path, cx.clone()).await?;
+            initial_scan(this.clone(), path.clone(), cx.clone()).await?;
 
             let (mut entries, _) = watcher.await;
             while let Some(entries) = entries.next().await {
+                if entries.iter().any(|event| {
+                    event.path == watched_path.as_ref() && event.kind == Some(PathEventKind::Rescan)
+                }) {
+                    let watched_path = watched_path.clone();
+                    this.update(cx, move |this, _| {
+                        this.remove_snippets_in_directory(&watched_path);
+                    })?;
+                    initial_scan(this.clone(), path.clone(), cx.clone()).await?;
+                    continue;
+                }
                 process_updates(
                     this.clone(),
                     entries.into_iter().map(|event| event.path).collect(),
@@ -207,6 +217,13 @@ impl SnippetProvider {
             }
             Ok(())
         }));
+    }
+
+    fn remove_snippets_in_directory(&mut self, path: &Path) {
+        self.snippets.retain(|_, snippets| {
+            snippets.retain(|source_path, _| !source_path.starts_with(path));
+            !snippets.is_empty()
+        });
     }
 
     fn lookup_snippets<'a, const LOOKUP_GLOBALS: bool>(
@@ -270,7 +287,7 @@ impl SnippetProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs::FakeFs;
+    use fs::{FakeFs, RemoveOptions};
     use gpui;
     use gpui::TestAppContext;
     use indoc::indoc;
@@ -298,6 +315,71 @@ mod tests {
             cx.update_entity(&provider, |provider, cx| {
                 assert_eq!(1, provider.snippets_for(Some("ruby".to_owned()), cx).len());
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_root_rescan_rebuilds_watched_directory(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        let snippets_dir = PathBuf::from("/snippets");
+        let old_path = snippets_dir.join("rust.json");
+        fs.create_dir(&snippets_dir).await.unwrap();
+        fs.insert_file(
+            &old_path,
+            br#"{
+                "Old snippet": {
+                    "prefix": "old",
+                    "body": "old"
+                }
+            }"#
+            .to_vec(),
+        )
+        .await;
+
+        let provider = cx.update(|cx| {
+            SnippetRegistry::init_global(cx);
+            SnippetProvider::new(fs.clone(), BTreeSet::from_iter([snippets_dir.clone()]), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let snippets = provider.read(cx).snippets_for(Some("rust".to_owned()), cx);
+            assert_eq!(snippets.len(), 1);
+            assert_eq!(snippets[0].name, "Old snippet");
+        });
+
+        let new_path = snippets_dir.join("rust-new.json");
+        fs.pause_events();
+        fs.remove_file(&old_path, RemoveOptions::default())
+            .await
+            .unwrap();
+        fs.insert_file(
+            &new_path,
+            br#"{
+                "New snippet": {
+                    "prefix": "new",
+                    "body": "new"
+                }
+            }"#
+            .to_vec(),
+        )
+        .await;
+        fs.clear_buffered_events();
+        fs.emit_fs_event(&snippets_dir, Some(PathEventKind::Rescan));
+        fs.unpause_events_and_flush();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                provider
+                    .read(cx)
+                    .snippets_for(Some("rust".to_owned()), cx)
+                    .is_empty()
+            );
+            let snippets = provider
+                .read(cx)
+                .snippets_for(Some("rust-new".to_owned()), cx);
+            assert_eq!(snippets.len(), 1);
+            assert_eq!(snippets[0].name, "New snippet");
         });
     }
 }
