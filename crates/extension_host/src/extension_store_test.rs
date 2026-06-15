@@ -6,7 +6,7 @@ use crate::{
 use async_compression::futures::bufread::GzipEncoder;
 use collections::{BTreeMap, HashSet};
 use extension::ExtensionHostProxy;
-use fs::{FakeFs, Fs, RealFs};
+use fs::{FakeFs, Fs, RealFs, RemoveOptions};
 use futures::{AsyncReadExt, FutureExt, StreamExt, io::BufReader};
 use gpui::{AppContext as _, BackgroundExecutor, TaskExt, TestAppContext};
 use http_client::{FakeHttpClient, Response};
@@ -1054,5 +1054,100 @@ fn init_test(cx: &mut TestAppContext) {
         extension::init(cx);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         gpui_tokio::init(cx);
+    });
+}
+
+#[gpui::test]
+async fn test_root_rescan_rebuilds_extension_index(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let http_client = FakeHttpClient::with_200_response();
+    fs.insert_tree(
+        "/extensions",
+        json!({
+            "installed": {
+                "old-extension": {
+                    "extension.json": r#"{
+                        "id": "old-extension",
+                        "name": "Old Extension",
+                        "version": "1.0.0"
+                    }"#
+                }
+            }
+        }),
+    )
+    .await;
+
+    let proxy = Arc::new(ExtensionHostProxy::new());
+    let theme_registry = Arc::new(ThemeRegistry::new(Box::new(())));
+    theme_extension::init(proxy.clone(), theme_registry, cx.executor());
+    let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+    language_extension::init(LspAccess::Noop, proxy.clone(), language_registry);
+    let store = cx.new(|cx| {
+        ExtensionStore::new(
+            PathBuf::from("/extensions"),
+            None,
+            proxy,
+            fs.clone(),
+            http_client.clone(),
+            http_client,
+            None,
+            NodeRuntime::unavailable(),
+            cx,
+        )
+    });
+    cx.executor().advance_clock(RELOAD_DEBOUNCE_DURATION);
+    cx.run_until_parked();
+    store.read_with(cx, |store, _| {
+        assert!(
+            store
+                .extension_index
+                .extensions
+                .contains_key("old-extension")
+        );
+    });
+
+    fs.pause_events();
+    fs.remove_dir(
+        Path::new("/extensions/installed/old-extension"),
+        RemoveOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    fs.insert_tree(
+        "/extensions/installed",
+        json!({
+            "new-extension": {
+                "extension.json": r#"{
+                    "id": "new-extension",
+                    "name": "New Extension",
+                    "version": "1.0.0"
+                }"#
+            }
+        }),
+    )
+    .await;
+    fs.clear_buffered_events();
+    fs.emit_fs_event("/extensions/installed", Some(fs::PathEventKind::Rescan));
+    fs.unpause_events_and_flush();
+    cx.executor().advance_clock(RELOAD_DEBOUNCE_DURATION);
+    cx.run_until_parked();
+
+    store.read_with(cx, |store, _| {
+        assert!(
+            !store
+                .extension_index
+                .extensions
+                .contains_key("old-extension")
+        );
+        assert!(
+            store
+                .extension_index
+                .extensions
+                .contains_key("new-extension")
+        );
     });
 }

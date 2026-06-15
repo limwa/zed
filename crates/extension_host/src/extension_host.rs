@@ -19,7 +19,7 @@ use extension::{
     ExtensionGrammarProxy, ExtensionHostProxy, ExtensionLanguageProxy,
     ExtensionLanguageServerProxy, ExtensionSnippetProxy, ExtensionThemeProxy,
 };
-use fs::{Fs, RemoveOptions, RenameOptions};
+use fs::{Fs, PathEventKind, RemoveOptions, RenameOptions};
 use futures::future::join_all;
 use futures::{
     AsyncReadExt as _, Future, FutureExt as _, StreamExt as _,
@@ -404,6 +404,14 @@ impl ExtensionStore {
                 let (mut paths, _) = fs.watch(&installed_dir, FS_WATCH_LATENCY).await;
                 while let Some(events) = paths.next().await {
                     for event in events {
+                        if event.path == installed_dir && event.kind == Some(PathEventKind::Rescan)
+                        {
+                            if reload_tx.unbounded_send(None).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+
                         let Ok(event_path) = event.path.strip_prefix(&installed_dir) else {
                             continue;
                         };
@@ -412,7 +420,9 @@ impl ExtensionStore {
                             event_path.components().next()
                             && let Some(extension_id) = extension_dir_name.to_str()
                         {
-                            reload_tx.unbounded_send(Some(extension_id.into())).ok();
+                            if reload_tx.unbounded_send(Some(extension_id.into())).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
