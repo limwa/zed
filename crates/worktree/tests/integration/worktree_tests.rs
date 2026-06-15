@@ -1360,6 +1360,74 @@ async fn test_root_rescan_does_not_miss_event_before_readding_root_watcher(
 }
 
 #[gpui::test]
+async fn test_root_rescan_removes_stale_external_symlink_watch(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.scan_symlinks =
+                    Some(settings::ScanSymlinksSetting::Always);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "project": {
+                "deps": {}
+            },
+            "outside": {
+                "data.txt": ""
+            }
+        }),
+    )
+    .await;
+    let symlink_path = Path::new("/root/project/deps/outside");
+    fs.create_symlink(symlink_path, PathBuf::from("../../outside"))
+        .await
+        .unwrap();
+
+    let tree = Worktree::local(
+        Path::new("/root/project"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    let external_path = PathBuf::from("/root/outside");
+    assert!(fs.watched_paths().contains(&external_path));
+
+    fs.pause_events();
+    fs.rename(
+        symlink_path,
+        Path::new("/removed-external-symlink"),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    fs.clear_buffered_events();
+    fs.emit_fs_event("/root/project", Some(PathEventKind::Rescan));
+    fs.unpause_events_and_flush();
+    tree.flush_fs_events(cx).await;
+
+    let watched_paths = fs.watched_paths();
+    assert!(watched_paths.contains(&PathBuf::from("/root/project")));
+    assert!(!watched_paths.contains(&external_path));
+    tree.read_with(cx, |tree, _| {
+        assert!(tree.entry_for_path(rel_path("deps/outside")).is_none());
+    });
+}
+
+#[gpui::test]
 async fn test_subtree_rescan_reports_unchanged_descendants_as_updated(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.background_executor.clone());

@@ -268,6 +268,7 @@ struct BackgroundScannerState {
     symlink_paths_by_target: HashMap<Arc<Path>, SmallVec<[Arc<RelPath>; 1]>>,
     scanned_dirs: HashSet<ProjectEntryId>,
     watched_dir_abs_paths_by_entry_id: HashMap<ProjectEntryId, Arc<Path>>,
+    pending_removed_watch_paths: HashSet<PathBuf>,
     path_prefixes_to_scan: HashSet<Arc<RelPath>>,
     paths_to_scan: HashSet<Arc<RelPath>>,
     /// The ids of all of the entries that were removed from the snapshot
@@ -1189,6 +1190,7 @@ impl LocalWorktree {
                         symlink_paths_by_target: Default::default(),
                         scanned_dirs: Default::default(),
                         watched_dir_abs_paths_by_entry_id: Default::default(),
+                        pending_removed_watch_paths: Default::default(),
                         scanning_enabled,
                         path_prefixes_to_scan: Default::default(),
                         paths_to_scan: Default::default(),
@@ -3166,6 +3168,10 @@ impl BackgroundScannerState {
 
     fn remove_path_from_snapshot(&mut self, path: &RelPath) -> Vec<PathBuf> {
         log::trace!("background scanner removing path {path:?}");
+        self.symlink_paths_by_target.retain(|_, symlink_paths| {
+            symlink_paths.retain(|symlink_path| !symlink_path.starts_with(path));
+            !symlink_paths.is_empty()
+        });
         let mut new_entries;
         let removed_entries;
         {
@@ -4670,8 +4676,33 @@ impl BackgroundScanner {
                 state.scanned_dirs.remove(&entry.id);
             }
         }
+        self.reconcile_removed_watch_paths().await;
         self.send_status_update(false, SmallVec::new(), &relative_paths)
             .await;
+    }
+
+    async fn reconcile_removed_watch_paths(&self) {
+        let stale_watch_paths = {
+            let mut state = self.state.lock().await;
+            let active_watch_paths = state
+                .watched_dir_abs_paths_by_entry_id
+                .values()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect::<HashSet<_>>();
+            let stale_watch_paths = mem::take(&mut state.pending_removed_watch_paths)
+                .into_iter()
+                .filter(|path| !active_watch_paths.contains(path))
+                .collect::<Vec<_>>();
+            state
+                .snapshot
+                .external_canonical_to_relative
+                .retain(|canonical, _| active_watch_paths.contains(canonical.as_ref()));
+            stale_watch_paths
+        };
+
+        for path in stale_watch_paths {
+            self.watcher.remove(&path).log_err();
+        }
     }
 
     async fn update_global_gitignore(&self, abs_path: &Path) {
@@ -5188,6 +5219,11 @@ impl BackgroundScanner {
             } else {
                 Vec::new()
             };
+            if doing_recursive_update {
+                state
+                    .pending_removed_watch_paths
+                    .extend(removed_descendant_paths.iter().cloned());
+            }
             paths_to_process.push((path, metadata, removed_descendant_paths));
         }
 
