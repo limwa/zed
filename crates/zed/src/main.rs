@@ -2230,27 +2230,65 @@ fn watch_languages(fs: Arc<dyn fs::Fs>, languages: Arc<LanguageRegistry>, cx: &m
 
         let (mut events, watcher) = fs.watch(&languages_src, Duration::from_millis(100)).await;
 
-        // add subdirectories since fs.watch is not recursive on Linux
-        if let Some(mut paths) = fs.read_dir(&languages_src).await.log_err() {
-            while let Some(path) = paths.next().await {
-                if let Some(path) = path.log_err()
-                    && fs.is_dir(&path).await
-                {
-                    watcher.add(&path).log_err();
-                }
-            }
-        }
+        let mut watched_language_dirs = HashSet::default();
+        reconcile_language_directory_watches(
+            &fs,
+            &languages_src,
+            &watcher,
+            &mut watched_language_dirs,
+        )
+        .await;
 
         while let Some(event) = events.next().await {
-            let has_language_file = event
-                .iter()
-                .any(|event| event.path.extension().is_some_and(|ext| ext == "scm"));
+            let root_was_rescanned = event.iter().any(|event| {
+                event.path == languages_src && event.kind == Some(fs::PathEventKind::Rescan)
+            });
+            if root_was_rescanned {
+                reconcile_language_directory_watches(
+                    &fs,
+                    &languages_src,
+                    &watcher,
+                    &mut watched_language_dirs,
+                )
+                .await;
+            }
+            let has_language_file = event.iter().any(|event| {
+                (event.path == languages_src && event.kind == Some(fs::PathEventKind::Rescan))
+                    || event.path.extension().is_some_and(|ext| ext == "scm")
+            });
             if has_language_file {
                 languages.reload();
             }
         }
     })
     .detach();
+}
+
+#[cfg(debug_assertions)]
+async fn reconcile_language_directory_watches(
+    fs: &Arc<dyn fs::Fs>,
+    languages_src: &Path,
+    watcher: &Arc<dyn fs::Watcher>,
+    watched_language_dirs: &mut HashSet<PathBuf>,
+) {
+    let mut current_language_dirs = HashSet::default();
+    if let Some(mut paths) = fs.read_dir(languages_src).await.log_err() {
+        while let Some(path) = paths.next().await {
+            if let Some(path) = path.log_err()
+                && fs.is_dir(&path).await
+            {
+                current_language_dirs.insert(path);
+            }
+        }
+    }
+
+    for path in current_language_dirs.difference(watched_language_dirs) {
+        watcher.add(path).log_err();
+    }
+    for path in watched_language_dirs.difference(&current_language_dirs) {
+        watcher.remove(path).log_err();
+    }
+    *watched_language_dirs = current_language_dirs;
 }
 
 fn dump_all_gpui_actions() {
