@@ -872,6 +872,7 @@ async fn test_realfs_watch_stress_reports_missed_paths(
     }
 
     let mut changed_paths = BTreeSet::new();
+    let mut rescan_paths = BTreeSet::new();
     let mut rescan_count: u32 = 0;
     let timeout = executor.timer(Duration::from_secs(10)).fuse();
 
@@ -883,6 +884,7 @@ async fn test_realfs_watch_stress_reports_missed_paths(
             for event in batch {
                 if event.kind == Some(PathEventKind::Rescan) {
                     rescan_count += 1;
+                    rescan_paths.insert(event.path.clone());
                 }
                 if expected_paths.contains(&event.path) {
                     changed_paths.insert(event.path);
@@ -912,5 +914,9 @@ async fn test_realfs_watch_stress_reports_missed_paths(
         missed_paths.is_empty() || rescan_count > 0,
         "missed {} paths without rescan being reported",
         missed_paths.len()
+    );
+    assert!(
+        rescan_paths.iter().all(|path| path == root),
+        "rescans must use the logical watch root, got {rescan_paths:?}"
     );
 }

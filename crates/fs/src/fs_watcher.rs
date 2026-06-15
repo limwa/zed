@@ -2,7 +2,7 @@ use gpui::{BackgroundExecutor, Task};
 use notify::{Event, EventKind};
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::DerefMut,
     path::Path,
     sync::{Arc, LazyLock, OnceLock},
@@ -20,6 +20,7 @@ pub enum WatcherMode {
 }
 
 pub struct FsWatcher {
+    owner_id: WatcherOwnerId,
     executor: BackgroundExecutor,
     tx: async_channel::Sender<()>,
     pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
@@ -35,11 +36,27 @@ struct FsWatcherRegistration {
 
 impl FsWatcher {
     pub fn new(
+        recovery_root: Arc<Path>,
         executor: BackgroundExecutor,
         tx: async_channel::Sender<()>,
         pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
     ) -> Self {
+        let owner_id = global_watcher().add_owner({
+            let tx = tx.clone();
+            let pending_path_events = pending_path_events.clone();
+            move || {
+                enqueue_path_events(
+                    &tx,
+                    &pending_path_events,
+                    vec![PathEvent {
+                        path: recovery_root.to_path_buf(),
+                        kind: Some(PathEventKind::Rescan),
+                    }],
+                );
+            }
+        });
         Self {
+            owner_id,
             executor,
             tx,
             pending_path_events,
@@ -50,9 +67,12 @@ impl FsWatcher {
 
     fn add_existing_path(&self, path: Arc<Path>) -> anyhow::Result<()> {
         let registration_path = path.clone();
-        if let Some(registration) =
-            register_existing_path(path, self.tx.clone(), self.pending_path_events.clone())?
-        {
+        if let Some(registration) = register_existing_path(
+            path,
+            self.owner_id,
+            self.tx.clone(),
+            self.pending_path_events.clone(),
+        )? {
             self.registrations
                 .lock()
                 .insert(registration_path, registration);
@@ -69,6 +89,7 @@ impl FsWatcher {
         let task = self.executor.spawn(poll_path_until_created(
             self.executor.clone(),
             path.clone(),
+            self.owner_id,
             self.tx.clone(),
             self.pending_path_events.clone(),
             self.registrations.clone(),
@@ -92,6 +113,7 @@ impl Drop for FsWatcher {
         for (_, registration) in registrations {
             global_watcher.remove(registration.id);
         }
+        global_watcher.remove_owner(self.owner_id);
     }
 }
 
@@ -182,6 +204,7 @@ pub fn requires_poll_watcher(path: &Path) -> bool {
 
 fn register_existing_path(
     path: Arc<Path>,
+    owner_id: WatcherOwnerId,
     tx: async_channel::Sender<()>,
     pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
 ) -> anyhow::Result<Option<FsWatcherRegistration>> {
@@ -197,17 +220,10 @@ fn register_existing_path(
         WatcherMode::Native
     };
     let root_path = SanitizedPath::new_arc(path.as_ref());
-    let path_for_callback = path.clone();
     let Some(registration_id) =
-        global_watcher().add(path, mode, move |event: &notify::Event| {
+        global_watcher().add(path, mode, owner_id, move |event: &notify::Event| {
             log::trace!("watcher received event: {event:?}");
-            push_notify_event(
-                &tx,
-                &pending_path_events,
-                &root_path,
-                path_for_callback.as_ref(),
-                event,
-            );
+            push_notify_event(&tx, &pending_path_events, &root_path, event);
         })?
     else {
         return Ok(None);
@@ -329,6 +345,7 @@ fn is_wsl_drvfs_path(path: &Path) -> bool {
 async fn poll_path_until_created(
     executor: BackgroundExecutor,
     path: Arc<Path>,
+    owner_id: WatcherOwnerId,
     tx: async_channel::Sender<()>,
     pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
     registrations: Arc<Mutex<BTreeMap<Arc<Path>, FsWatcherRegistration>>>,
@@ -350,7 +367,12 @@ async fn poll_path_until_created(
             return;
         }
 
-        match register_existing_path(path.clone(), tx.clone(), pending_path_events.clone()) {
+        match register_existing_path(
+            path.clone(),
+            owner_id,
+            tx.clone(),
+            pending_path_events.clone(),
+        ) {
             Ok(Some(registration)) => {
                 {
                     let mut pending_registrations = pending_registrations.lock();
@@ -408,7 +430,6 @@ fn push_notify_event(
     tx: &smol::channel::Sender<()>,
     pending_path_events: &Arc<Mutex<Vec<PathEvent>>>,
     root_path: &SanitizedPath,
-    watched_root: &Path,
     event: &notify::Event,
 ) {
     let kind = match event.kind {
@@ -417,7 +438,7 @@ fn push_notify_event(
         EventKind::Remove(_) => Some(PathEventKind::Removed),
         _ => None,
     };
-    let mut path_events = event
+    let path_events = event
         .paths
         .iter()
         .filter_map(|event_path| {
@@ -429,41 +450,8 @@ fn push_notify_event(
         })
         .collect::<Vec<_>>();
 
-    if event.need_rescan() {
-        if !watcher_logging_rate_limited() {
-            log::warn!("filesystem watcher lost sync for {watched_root:?}; scheduling rescan");
-        }
-
-        path_events.retain(|path_event| path_event.path != watched_root);
-        path_events.push(PathEvent {
-            path: watched_root.to_path_buf(),
-            kind: Some(PathEventKind::Rescan),
-        });
-    }
     log::trace!("path_events: {:?}", path_events);
     enqueue_path_events(tx, pending_path_events, path_events);
-}
-
-fn watcher_logging_rate_limited() -> bool {
-    static LAST_WARN: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
-    let Some((ref mut started, ref mut emitted)) = *LAST_WARN.lock() else {
-        *LAST_WARN.lock() = Some((Instant::now(), 0));
-        return false;
-    };
-
-    if started.elapsed().as_secs() < 1 {
-        if *emitted < 20 {
-            log::warn!("filesystem watcher lost sync for many files, not logging more");
-            return true;
-        } else {
-            *emitted += 1;
-        }
-    } else {
-        *emitted = 0;
-        *started = Instant::now()
-    }
-
-    true
 }
 
 fn coalesce_pending_rescans(pending_paths: &mut Vec<PathEvent>, path_events: &mut Vec<PathEvent>) {
@@ -519,10 +507,14 @@ fn is_covered_rescan(kind: Option<PathEventKind>, path: &Path, ancestor: &Path) 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct WatcherRegistrationId(u32);
 
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+struct WatcherOwnerId(u32);
+
 struct WatcherRegistrationState {
     callback: Arc<dyn Fn(&notify::Event) + Send + Sync>,
     path: Arc<std::path::Path>,
     mode: WatcherMode,
+    owner_id: WatcherOwnerId,
 }
 
 struct PathRegistrationState {
@@ -531,11 +523,13 @@ struct PathRegistrationState {
 }
 
 struct WatcherState {
+    owners: HashMap<WatcherOwnerId, Arc<dyn Fn() + Send + Sync>>,
     watchers: HashMap<WatcherRegistrationId, WatcherRegistrationState>,
     native_path_registrations: HashMap<Arc<std::path::Path>, PathRegistrationState>,
     poll_path_registrations: HashMap<Arc<std::path::Path>, PathRegistrationState>,
     cooldown_until: Option<Instant>,
     last_registration: WatcherRegistrationId,
+    last_owner: WatcherOwnerId,
 }
 
 impl WatcherState {
@@ -598,11 +592,78 @@ pub struct GlobalWatcher {
 }
 
 impl GlobalWatcher {
+    fn add_owner(&self, callback: impl Fn() + Send + Sync + 'static) -> WatcherOwnerId {
+        let mut state = self.state.lock();
+        let id = state.last_owner;
+        state.last_owner = WatcherOwnerId(id.0 + 1);
+        state.owners.insert(id, Arc::new(callback));
+        id
+    }
+
+    fn remove_owner(&self, id: WatcherOwnerId) {
+        self.state.lock().owners.remove(&id);
+    }
+
+    fn handle_path_event(&self, mode: WatcherMode, event: &notify::Event) {
+        let callbacks = {
+            let state = self.state.lock();
+            state
+                .watchers
+                .values()
+                .filter(|registration| registration.mode == mode)
+                .map(|registration| registration.callback.clone())
+                .collect::<Vec<_>>()
+        };
+
+        for callback in callbacks {
+            callback(event);
+        }
+    }
+
+    fn handle_rescan(&self, mode: WatcherMode) {
+        let (callbacks, registration_count, descriptor_count) = {
+            let state = self.state.lock();
+            let owner_ids = state
+                .watchers
+                .values()
+                .filter(|registration| registration.mode == mode)
+                .map(|registration| registration.owner_id)
+                .collect::<HashSet<_>>();
+            let callbacks = owner_ids
+                .iter()
+                .filter_map(|owner_id| state.owners.get(owner_id).cloned())
+                .collect::<Vec<_>>();
+            let registration_count = state
+                .watchers
+                .values()
+                .filter(|registration| registration.mode == mode)
+                .count();
+            let path_registrations = match mode {
+                WatcherMode::Native => &state.native_path_registrations,
+                WatcherMode::Poll => &state.poll_path_registrations,
+            };
+            let descriptor_count = path_registrations
+                .values()
+                .filter(|registration| registration.has_os_watcher)
+                .count();
+            (callbacks, registration_count, descriptor_count)
+        };
+
+        log::warn!(
+            "filesystem watcher lost sync for {mode:?}; scheduling rescans for {} owners using {descriptor_count} descriptors ({registration_count} registrations)",
+            callbacks.len(),
+        );
+        for callback in callbacks {
+            callback();
+        }
+    }
+
     #[must_use]
     fn add(
         &self,
         path: Arc<std::path::Path>,
         mode: WatcherMode,
+        owner_id: WatcherOwnerId,
         cb: impl Fn(&notify::Event) + Send + Sync + 'static,
     ) -> anyhow::Result<Option<WatcherRegistrationId>> {
         let mut state = self.state.lock();
@@ -638,6 +699,7 @@ impl GlobalWatcher {
             callback: Arc::new(cb),
             path: path.clone(),
             mode,
+            owner_id,
         };
         state.watchers.insert(id, registration_state);
         state
@@ -795,11 +857,13 @@ static FS_WATCHER_INSTANCE: OnceLock<GlobalWatcher> = OnceLock::new();
 fn global_watcher() -> &'static GlobalWatcher {
     FS_WATCHER_INSTANCE.get_or_init(|| GlobalWatcher {
         state: Mutex::new(WatcherState {
+            owners: Default::default(),
             watchers: Default::default(),
             native_path_registrations: Default::default(),
             poll_path_registrations: Default::default(),
             cooldown_until: None,
             last_registration: Default::default(),
+            last_owner: Default::default(),
         }),
         native_watcher: Mutex::new(None),
         poll_watcher: Mutex::new(None),
@@ -827,26 +891,12 @@ fn handle_event(mode: WatcherMode, event: Result<notify::Event, notify::Error>) 
 
     log::trace!("global handle event for {mode:?}: {event:?}");
 
-    let callbacks = {
-        let state = global_watcher().state.lock();
-        state
-            .watchers
-            .values()
-            .filter(|registration| registration.mode == mode)
-            .map(|registration| registration.callback.clone())
-            .collect::<Vec<_>>()
-    };
-
     match event {
         Ok(event) => {
             if event.need_rescan() {
-                log::warn!(
-                    "filesystem watcher lost sync for {mode:?}; scheduling rescans for {} registrations",
-                    callbacks.len()
-                );
-            }
-            for callback in callbacks {
-                callback(&event);
+                global_watcher().handle_rescan(mode);
+            } else {
+                global_watcher().handle_path_event(mode, &event);
             }
         }
         Err(error) => {
@@ -918,11 +968,13 @@ mod tests {
     ) -> GlobalWatcher {
         GlobalWatcher {
             state: Mutex::new(WatcherState {
+                owners: Default::default(),
                 watchers: Default::default(),
                 native_path_registrations: Default::default(),
                 poll_path_registrations: Default::default(),
                 cooldown_until: None,
                 last_registration: Default::default(),
+                last_owner: Default::default(),
             }),
             native_watcher: Mutex::new(
                 native_watcher.map(|watcher| {
@@ -951,13 +1003,14 @@ mod tests {
         let watcher = test_watcher(backend.clone());
         let parent = Arc::<Path>::from(Path::new("/repo"));
         let child = Arc::<Path>::from(Path::new("/repo/foo.csproj"));
+        let owner_id = watcher.add_owner(|| {});
 
         let parent_registration = watcher
-            .add(parent.as_ref().into(), WatcherMode::Poll, |_| {})
+            .add(parent.as_ref().into(), WatcherMode::Poll, owner_id, |_| {})
             .expect("add parent watch")
             .expect("parent watch registered");
         let child_registration = watcher
-            .add(child.as_ref().into(), WatcherMode::Poll, |_| {})
+            .add(child.as_ref().into(), WatcherMode::Poll, owner_id, |_| {})
             .expect("add covered child watch")
             .expect("child watch registered");
 
@@ -979,12 +1032,13 @@ mod tests {
         let watcher = test_watcher_with_backends(Some(native_backend.clone()), Some(poll_backend));
         let first_path = Arc::<Path>::from(Path::new("/repo/first"));
         let second_path = Arc::<Path>::from(Path::new("/repo/second"));
+        let owner_id = watcher.add_owner(|| {});
 
         let first_registration = watcher
-            .add(first_path.clone(), WatcherMode::Native, |_| {})
+            .add(first_path.clone(), WatcherMode::Native, owner_id, |_| {})
             .expect("native watch limit is handled");
         let second_registration = watcher
-            .add(second_path, WatcherMode::Native, |_| {})
+            .add(second_path, WatcherMode::Native, owner_id, |_| {})
             .expect("native watch limit backoff is handled");
 
         assert!(first_registration.is_none());
@@ -992,6 +1046,142 @@ mod tests {
 
         let native_backend = native_backend.lock();
         assert_eq!(native_backend.watch_calls, &[first_path.to_path_buf()]);
+    }
+
+    #[test]
+    fn backend_rescan_is_emitted_once_per_registered_owner() {
+        let native_backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
+        let poll_backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
+        let watcher =
+            test_watcher_with_backends(Some(native_backend.clone()), Some(poll_backend.clone()));
+        let rescanned_roots = Arc::new(Mutex::new(Vec::new()));
+        let add_owner = |watcher: &GlobalWatcher, root: &'static str| {
+            watcher.add_owner({
+                let rescanned_roots = rescanned_roots.clone();
+                move || rescanned_roots.lock().push(PathBuf::from(root))
+            })
+        };
+
+        let native_owner = add_owner(&watcher, "/native-root");
+        let shared_native_owner = add_owner(&watcher, "/shared-native-root");
+        let poll_owner = add_owner(&watcher, "/poll-root");
+        let mixed_owner = add_owner(&watcher, "/mixed-root");
+        let dropped_owner = add_owner(&watcher, "/dropped-root");
+        let _owner_without_registrations = add_owner(&watcher, "/unused-root");
+
+        let mut native_registrations = Vec::new();
+        for index in 0..2_000 {
+            let path = Arc::<Path>::from(PathBuf::from(format!("/native-root/{index}")));
+            native_registrations.push(
+                watcher
+                    .add(path, WatcherMode::Native, native_owner, |_| {})
+                    .expect("add native watch")
+                    .expect("native watch registered"),
+            );
+        }
+
+        let shared_path = Arc::<Path>::from(Path::new("/shared/path"));
+        native_registrations.push(
+            watcher
+                .add(
+                    shared_path.clone(),
+                    WatcherMode::Native,
+                    native_owner,
+                    |_| {},
+                )
+                .expect("add shared native watch")
+                .expect("shared native watch registered"),
+        );
+        native_registrations.push(
+            watcher
+                .add(
+                    shared_path,
+                    WatcherMode::Native,
+                    shared_native_owner,
+                    |_| {},
+                )
+                .expect("add second shared native watch")
+                .expect("second shared native watch registered"),
+        );
+        native_registrations.push(
+            watcher
+                .add(
+                    Arc::<Path>::from(Path::new("/mixed/native")),
+                    WatcherMode::Native,
+                    mixed_owner,
+                    |_| {},
+                )
+                .expect("add mixed native watch")
+                .expect("mixed native watch registered"),
+        );
+
+        let poll_root = Arc::<Path>::from(Path::new("/poll-root"));
+        let mut poll_registrations = vec![
+            watcher
+                .add(poll_root, WatcherMode::Poll, poll_owner, |_| {})
+                .expect("add poll root")
+                .expect("poll root registered"),
+        ];
+        for index in 0..2_000 {
+            let path = Arc::<Path>::from(PathBuf::from(format!("/poll-root/{index}")));
+            poll_registrations.push(
+                watcher
+                    .add(path, WatcherMode::Poll, poll_owner, |_| {})
+                    .expect("add covered poll watch")
+                    .expect("covered poll watch registered"),
+            );
+        }
+        poll_registrations.push(
+            watcher
+                .add(
+                    Arc::<Path>::from(Path::new("/mixed/poll")),
+                    WatcherMode::Poll,
+                    mixed_owner,
+                    |_| {},
+                )
+                .expect("add mixed poll watch")
+                .expect("mixed poll watch registered"),
+        );
+
+        let dropped_registration = watcher
+            .add(
+                Arc::<Path>::from(Path::new("/dropped-root/path")),
+                WatcherMode::Native,
+                dropped_owner,
+                |_| {},
+            )
+            .expect("add dropped owner watch")
+            .expect("dropped owner watch registered");
+        watcher.remove(dropped_registration);
+        watcher.remove_owner(dropped_owner);
+
+        watcher.handle_rescan(WatcherMode::Native);
+        let mut native_roots = rescanned_roots.lock().clone();
+        native_roots.sort();
+        assert_eq!(
+            native_roots,
+            [
+                PathBuf::from("/mixed-root"),
+                PathBuf::from("/native-root"),
+                PathBuf::from("/shared-native-root"),
+            ]
+        );
+
+        rescanned_roots.lock().clear();
+        watcher.handle_rescan(WatcherMode::Poll);
+        let mut poll_roots = rescanned_roots.lock().clone();
+        poll_roots.sort();
+        assert_eq!(
+            poll_roots,
+            [PathBuf::from("/mixed-root"), PathBuf::from("/poll-root")]
+        );
+
+        assert_eq!(native_backend.lock().watched_paths.len(), 2_002);
+        assert_eq!(poll_backend.lock().watched_paths.len(), 2);
+
+        for registration in native_registrations.into_iter().chain(poll_registrations) {
+            watcher.remove(registration);
+        }
     }
 
     #[test]

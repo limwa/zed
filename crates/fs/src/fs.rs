@@ -1076,6 +1076,7 @@ impl Fs for RealFs {
         let pending_paths: Arc<Mutex<Vec<PathEvent>>> = Default::default();
 
         let watcher: Arc<dyn Watcher> = Arc::new(fs_watcher::FsWatcher::new(
+            path.into(),
             executor.clone(),
             tx.clone(),
             pending_paths.clone(),
