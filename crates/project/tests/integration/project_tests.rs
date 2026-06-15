@@ -2057,7 +2057,6 @@ async fn test_language_server_relative_path(cx: &mut gpui::TestAppContext) {
         }),
     )
     .await;
-
     let project = Project::test(fs.clone(), [path!("/the-root").as_ref()], cx).await;
     let language_registry = project.read_with(cx, |project, _| project.languages().clone());
     language_registry.add(rust_lang());
@@ -2159,7 +2158,7 @@ async fn test_language_server_tilde_path(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_rescan_fs_change_is_reported_to_language_servers_as_changed(
+async fn test_root_rescan_is_reported_to_language_servers_as_changed(
     cx: &mut gpui::TestAppContext,
 ) {
     init_test(cx);
@@ -2171,6 +2170,15 @@ async fn test_rescan_fs_change_is_reported_to_language_servers_as_changed(
             "Cargo.lock": "",
             "src": {
                 "a.rs": "",
+            }
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/external"),
+        json!({
+            "nested": {
+                "Cargo.lock": ""
             }
         }),
     )
@@ -2212,7 +2220,7 @@ async fn test_rescan_fs_change_is_reported_to_language_servers_as_changed(
                         lsp::DidChangeWatchedFilesRegistrationOptions {
                             watchers: vec![lsp::FileSystemWatcher {
                                 glob_pattern: lsp::GlobPattern::String(
-                                    path!("/the-root/Cargo.lock").to_string(),
+                                    path!("/external/**/*.lock").to_string(),
                                 ),
                                 kind: None,
                             }],
@@ -2237,13 +2245,13 @@ async fn test_rescan_fs_change_is_reported_to_language_servers_as_changed(
     cx.executor().run_until_parked();
     assert_eq!(mem::take(&mut *file_changes.lock()), &[]);
 
-    fs.emit_fs_event(path!("/the-root/Cargo.lock"), Some(PathEventKind::Rescan));
+    fs.emit_fs_event(path!("/external"), Some(PathEventKind::Rescan));
     cx.executor().run_until_parked();
 
     assert_eq!(
         &*file_changes.lock(),
         &[lsp::FileEvent {
-            uri: lsp::Uri::from_file_path(path!("/the-root/Cargo.lock")).unwrap(),
+            uri: lsp::Uri::from_file_path(path!("/external")).unwrap(),
             typ: lsp::FileChangeType::CHANGED,
         }]
     );

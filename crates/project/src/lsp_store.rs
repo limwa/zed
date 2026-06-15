@@ -14340,7 +14340,11 @@ impl LanguageServerWatchedPaths {
                                 };
                                 let matching_entries = update
                                     .into_iter()
-                                    .filter(|event| globs.is_match(&event.path))
+                                    .filter(|event| {
+                                        (event.path == abs_path.as_ref()
+                                            && event.kind == Some(PathEventKind::Rescan))
+                                            || globs.is_match(&event.path)
+                                    })
                                     .collect::<Vec<_>>();
                                 this.lsp_notify_abs_paths_changed(
                                     language_server_id,
