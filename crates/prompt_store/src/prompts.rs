@@ -134,7 +134,10 @@ pub struct ContentPromptContextV2 {
 mod tests {
     use super::*;
     use agent_skills::{Skill, SkillSource};
-    use std::path::PathBuf;
+    use fs::{FakeFs, RemoveOptions};
+    use gpui::TestAppContext;
+    use serde_json::json;
+    use std::{path::PathBuf, time::Duration};
 
     #[test]
     fn test_project_context_does_not_filter_by_budget() {
@@ -164,6 +167,62 @@ mod tests {
         let context = ProjectContext::new(vec![]);
         assert!(!context.has_skills);
         assert!(context.skills.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_root_rescan_rebuilds_prompt_overrides(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        let repo_path = PathBuf::from("/repo");
+        let templates_dir = paths::prompt_overrides_dir(Some(&repo_path));
+        fs.create_dir(&templates_dir).await.unwrap();
+        let old_template = templates_dir.join("old.hbs");
+        fs.insert_file(&old_template, b"old".to_vec()).await;
+
+        let prompt_builder = cx.update(|cx| {
+            PromptBuilder::new(Some(PromptLoadingParams {
+                fs: fs.clone(),
+                repo_path: Some(repo_path.clone()),
+                cx,
+            }))
+            .unwrap()
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            prompt_builder
+                .handlebars
+                .lock()
+                .render("old", &json!({}))
+                .unwrap(),
+            "old"
+        );
+
+        let new_template = templates_dir.join("new.hbs");
+        fs.pause_events();
+        fs.remove_file(&old_template, RemoveOptions::default())
+            .await
+            .unwrap();
+        fs.insert_file(&new_template, b"new".to_vec()).await;
+        fs.clear_buffered_events();
+        fs.emit_fs_event(&templates_dir, Some(fs::PathEventKind::Rescan));
+        fs.unpause_events_and_flush();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        assert!(
+            prompt_builder
+                .handlebars
+                .lock()
+                .render("old", &json!({}))
+                .is_err()
+        );
+        assert_eq!(
+            prompt_builder
+                .handlebars
+                .lock()
+                .render("new", &json!({}))
+                .unwrap(),
+            "new"
+        );
     }
 
     // Hidden-skill filtering used to live here, but it's now the
@@ -293,17 +352,7 @@ impl PromptBuilder {
 
                 found_dir_once = true;
 
-                // Initial scan of the prompt overrides directory
-                if let Ok(mut entries) = params.fs.read_dir(&templates_dir).await {
-                    while let Some(Ok(file_path)) = entries.next().await {
-                        if file_path.to_string_lossy().ends_with(".hbs")
-                            && let Ok(content) = params.fs.load(&file_path).await {
-                                let file_name = file_path.file_stem().unwrap().to_string_lossy();
-                                log::debug!("Registering prompt template override: {}", file_name);
-                                handlebars.lock().register_template_string(&file_name, content).log_err();
-                            }
-                    }
-                }
+                Self::rebuild_templates(&params.fs, &templates_dir, &handlebars).await;
 
                 // Watch both the parent directory and the template overrides directory:
                 // - Monitor the parent directory to detect if the template overrides directory is deleted.
@@ -314,18 +363,31 @@ impl PromptBuilder {
                 let mut combined_changes = futures::stream::select(changes, parent_changes);
 
                 while let Some(changed_paths) = combined_changes.next().await {
-                    if changed_paths.iter().any(|p| &p.path == &templates_dir)
-                        && !params.fs.is_dir(&templates_dir).await {
-                            log::info!("Prompt template overrides directory removed. Restoring built-in prompt templates.");
-                            Self::register_built_in_templates(&mut handlebars.lock()).log_err();
+                    if changed_paths.iter().any(|event| {
+                        event.path == templates_dir
+                            && event.kind == Some(fs::PathEventKind::Rescan)
+                    }) {
+                        Self::rebuild_templates(&params.fs, &templates_dir, &handlebars).await;
+                        if !params.fs.is_dir(&templates_dir).await {
                             break;
                         }
+                        continue;
+                    }
+
+                    if changed_paths.iter().any(|p| &p.path == &templates_dir)
+                        && !params.fs.is_dir(&templates_dir).await {
+                        log::info!("Prompt template overrides directory removed. Restoring built-in prompt templates.");
+                        Self::rebuild_templates(&params.fs, &templates_dir, &handlebars).await;
+                        break;
+                    }
                     for event in changed_paths {
                         if event.path.starts_with(&templates_dir) && event.path.extension().is_some_and(|ext| ext == "hbs") {
                             log::info!("Reloading prompt template override: {}", event.path.display());
                             if let Some(content) = params.fs.load(&event.path).await.log_err() {
-                                let file_name = event.path.file_stem().unwrap().to_string_lossy();
-                                handlebars.lock().register_template_string(&file_name, content).log_err();
+                                let Some(file_name) = event.path.file_stem() else {
+                                    continue;
+                                };
+                                handlebars.lock().register_template_string(&file_name.to_string_lossy(), content).log_err();
                             }
                         }
                     }
@@ -336,6 +398,49 @@ impl PromptBuilder {
             }
         })
             .detach();
+    }
+
+    async fn rebuild_templates(
+        fs: &Arc<dyn Fs>,
+        templates_dir: &Path,
+        handlebars: &Arc<Mutex<Handlebars<'static>>>,
+    ) {
+        let mut rebuilt = Handlebars::new();
+        if Self::register_built_in_templates(&mut rebuilt)
+            .log_err()
+            .is_none()
+        {
+            return;
+        }
+
+        if let Ok(mut entries) = fs.read_dir(templates_dir).await {
+            while let Some(entry) = entries.next().await {
+                let Some(file_path) = entry.log_err() else {
+                    continue;
+                };
+                if file_path
+                    .extension()
+                    .is_none_or(|extension| extension != "hbs")
+                {
+                    continue;
+                }
+                let Some(content) = fs.load(&file_path).await.log_err() else {
+                    continue;
+                };
+                let Some(file_name) = file_path.file_stem() else {
+                    continue;
+                };
+                log::debug!(
+                    "Registering prompt template override: {}",
+                    file_name.to_string_lossy()
+                );
+                rebuilt
+                    .register_template_string(&file_name.to_string_lossy(), content)
+                    .log_err();
+            }
+        }
+
+        *handlebars.lock() = rebuilt;
     }
 
     fn register_built_in_templates(handlebars: &mut Handlebars) -> Result<()> {
