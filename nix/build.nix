@@ -1,3 +1,4 @@
+
 {
   pkgs,
   system,
@@ -265,6 +266,12 @@ let
 
       cargoVendorDir = craneLib.vendorCargoDeps {
         inherit src cargoLock;
+        
+        outputHashes = {
+          # Needed for Git LFS
+          "git+https://github.com/zed-industries/livekit-rust-sdks?rev=37835f840d0070d45ac8b31cce6a6ae7aca3f459#37835f840d0070d45ac8b31cce6a6ae7aca3f459" = "";
+        };
+        
         overrideVendorGitCheckout =
           let
             hasWebRtcSys = builtins.any (crate: crate.name == "webrtc-sys");
